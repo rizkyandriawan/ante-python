@@ -1,0 +1,10 @@
+/target/
+/.venv/
+/.ante/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+*.redb
+/dist/

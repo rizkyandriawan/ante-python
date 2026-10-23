@@ -1,0 +1,17 @@
+[package]
+name = "ante-python"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace]
+members = ["vendor/ante-core"]
+
+[lib]
+name = "_native"
+path = "rust/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+ante-core = { path = "vendor/ante-core" }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
