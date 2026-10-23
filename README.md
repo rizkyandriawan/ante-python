@@ -171,14 +171,26 @@ values as binary. Batch publishing preserves each message's content type.
 `parse(raw, content_type)` optionally overrides payload decoding.
 The dispatcher polls the embedded store with a 20ms maximum idle interval;
 `take(wait_ms=...)` uses a local wake event for published/requeued messages.
-There is no RESP or AMQP transport in this SDK.
+An optional AMQP listener shares the same engine in-process:
+
+```python
+with Ante.open() as ante:
+    host, port = ante.serve_amqp(host="127.0.0.1", port=5672)
+    # External pika/lapin/amqplib clients can publish/consume the same queues.
+    # ante.stop_amqp() stops it explicitly; close() stops and joins it as well.
+```
+
+Plain `Ante.open()` still opens no socket. The listener supports Ante's AMQP
+subset (default exchange, durable queues, confirms, manual ack/nack, prefetch),
+not the complete RabbitMQ broker feature set. It has no authentication or TLS;
+the default bind address is loopback. Use port `0` for an OS-assigned port.
 
 ## Development / verification
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install maturin coverage ruff
+pip install maturin coverage ruff pika
 maturin develop --release
 python -m unittest discover -s tests -v
 coverage run --source=ante -m unittest discover -s tests
@@ -186,7 +198,7 @@ coverage report -m
 ruff check src tests
 cargo fmt --all --check
 cargo clippy --release --workspace -- -D warnings
-cargo test --release -p ante-core
+cargo test --release --workspace --exclude ante-python
 maturin build --release
 maturin sdist
 ```

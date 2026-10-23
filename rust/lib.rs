@@ -1,4 +1,5 @@
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use ante_core::{AckOutcome, Ante, DeliveryToken, NewMessage, RequeueOutcome};
 use pyo3::exceptions::PyRuntimeError;
@@ -13,7 +14,34 @@ fn error(err: ante_core::Error) -> PyErr {
 
 #[pyclass(frozen)]
 struct Engine {
-    inner: RwLock<Option<Ante>>,
+    inner: RwLock<Option<Arc<Ante>>>,
+    server: Mutex<Option<AmqpServer>>,
+}
+
+struct AmqpServer {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+impl AmqpServer {
+    fn stop(&mut self) -> PyResult<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| NativeError::new_err(("AMQP", "listener thread panicked")))?
+                .map_err(|e| NativeError::new_err(("AMQP", e.to_string())))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AmqpServer {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
 }
 
 impl Engine {
@@ -90,7 +118,8 @@ impl Engine {
     fn new(py: Python<'_>, path: String) -> PyResult<Self> {
         let engine = py.allow_threads(|| Ante::open(path)).map_err(error)?;
         Ok(Self {
-            inner: RwLock::new(Some(engine)),
+            inner: RwLock::new(Some(Arc::new(engine))),
+            server: Mutex::new(None),
         })
     }
 
@@ -100,7 +129,77 @@ impl Engine {
                 .inner
                 .write()
                 .map_err(|_| NativeError::new_err(("INTERNAL", "engine lock poisoned")))?;
+            if let Some(mut server) = self
+                .server
+                .lock()
+                .map_err(|_| NativeError::new_err(("INTERNAL", "server lock poisoned")))?
+                .take()
+            {
+                server.stop()?;
+            }
             guard.take();
+            Ok(())
+        })
+    }
+
+    fn serve_amqp(&self, py: Python<'_>, host: String, port: u16) -> PyResult<(String, u16)> {
+        py.allow_threads(|| {
+            let guard = self
+                .inner
+                .read()
+                .map_err(|_| NativeError::new_err(("INTERNAL", "engine lock poisoned")))?;
+            let engine = guard
+                .as_ref()
+                .ok_or_else(|| NativeError::new_err(("CLOSED", "engine is closed")))?
+                .clone();
+            let mut server = self
+                .server
+                .lock()
+                .map_err(|_| NativeError::new_err(("INTERNAL", "server lock poisoned")))?;
+            if server.is_some() {
+                return Err(NativeError::new_err(("AMQP", "listener already running")));
+            }
+            let listener = std::net::TcpListener::bind((host.as_str(), port))
+                .map_err(|e| NativeError::new_err(("AMQP", e.to_string())))?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| NativeError::new_err(("AMQP", e.to_string())))?;
+            let address = listener
+                .local_addr()
+                .map_err(|e| NativeError::new_err(("AMQP", e.to_string())))?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| NativeError::new_err(("AMQP", e.to_string())))?;
+            let (stop, shutdown) = tokio::sync::oneshot::channel();
+            let thread = std::thread::Builder::new()
+                .name("ante-amqp".into())
+                .spawn(move || {
+                    runtime.block_on(async move {
+                        let listener = tokio::net::TcpListener::from_std(listener)?;
+                        ante_amqp::serve_until(listener, engine, shutdown).await
+                    })
+                })
+                .map_err(|e| NativeError::new_err(("AMQP", e.to_string())))?;
+            *server = Some(AmqpServer {
+                stop: Some(stop),
+                thread: Some(thread),
+            });
+            Ok((address.ip().to_string(), address.port()))
+        })
+    }
+
+    fn stop_amqp(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            if let Some(mut server) = self
+                .server
+                .lock()
+                .map_err(|_| NativeError::new_err(("INTERNAL", "server lock poisoned")))?
+                .take()
+            {
+                server.stop()?;
+            }
             Ok(())
         })
     }

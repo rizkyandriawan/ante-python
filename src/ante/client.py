@@ -92,6 +92,13 @@ class Ante:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    def serve_amqp(self, host: str = "127.0.0.1", port: int = 5672) -> tuple[str, int]:
+        """Listen for AMQP clients on the same embedded queue engine."""
+        return self._call("serve_amqp", host, port)
+
+    def stop_amqp(self) -> None:
+        self._call("stop_amqp")
+
     def declare(self, queue: str) -> int:
         return self._call("declare", queue)
 

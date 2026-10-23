@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace]
-members = ["vendor/ante-core"]
+members = ["vendor/ante-core", "vendor/ante-amqp"]
 
 [lib]
 name = "_native"
@@ -15,3 +15,5 @@ crate-type = ["cdylib"]
 [dependencies]
 ante-core = { path = "vendor/ante-core" }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+ante-amqp = { path = "vendor/ante-amqp" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }

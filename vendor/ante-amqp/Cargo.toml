@@ -1,0 +1,13 @@
+[package]
+name = "ante-amqp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+ante-core = { path = "../ante-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+
+[dev-dependencies]
+lapin = "3"
+futures-util = "0.3"
