@@ -10,7 +10,8 @@ mod store;
 pub use error::{Error, Result};
 pub use store::{
     AckOutcome, Ante, AttemptInfo, Completion, Delivery, DeliveryToken, MessageState,
-    MessageStatus, NewMessage, Options, QueueInfo, RequeueOutcome, Settlement, DEFAULT_LEASE_MS,
+    MessageStatus, NewMessage, Options, QueueInfo, RequeueOutcome, Settlement,
+    DEFAULT_HISTORY_MAX_ROWS, DEFAULT_HISTORY_RETENTION_MS, DEFAULT_LEASE_MS,
 };
 
 pub const SCHEMA_VERSION: u64 = 2;

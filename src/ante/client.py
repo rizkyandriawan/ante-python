@@ -106,11 +106,17 @@ class Ante:
         self._wake = threading.Event()
 
     @classmethod
-    def open(cls, db: str | os.PathLike[str] | None = None) -> Ante:
+    def open(
+        cls,
+        db: str | os.PathLike[str] | None = None,
+        *,
+        history_retention_ms: int | None = None,
+        history_max_rows: int | None = None,
+    ) -> Ante:
         path = _database_path(db)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            return cls(Engine(str(path)))
+            return cls(Engine(str(path), history_retention_ms, history_max_rows))
         except NativeError as error:
             raise AnteError(*error.args) from error
 
@@ -316,6 +322,10 @@ class Ante:
 
     def queue_exists(self, queue: str) -> bool:
         return self._call("queue_exists", queue)
+
+    def prune_history(self) -> int:
+        """Apply the attempt-history retention policy and return rows removed."""
+        return self._call("prune_history")
 
     def recover_expired(self) -> int:
         return self._call("recover_expired")

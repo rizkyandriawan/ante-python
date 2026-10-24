@@ -165,8 +165,11 @@ Additional storage operations:
 - `ack(*tokens)` → per-token `AckResult`; `requeue(token)`.
 - `info(queue)`, `list_queues()`, `queue_exists(queue)`.
 - `message_status(queue, message_id)` returns `state`, timestamps, and retained
-  attempt history, or `None` for an unknown message. History survives ack and
-  queue deletion.
+  attempt history, or `None` for an unknown or pruned message. History survives
+  ack and queue deletion.
+- `Ante.open(..., history_retention_ms=..., history_max_rows=...)` configures
+  bounded history; `prune_history()` applies it immediately. Defaults are
+  7 days and 1,000,000 finished attempts; zero disables a limit.
 - `delivery.discard()` permanently drops a message and records `discarded`
   instead of `acked`; the high-level `on_error` drop policy uses it.
 - `delivery.complete(queue, result, ...)` publishes the result and settles the

@@ -67,6 +67,8 @@ CREATE INDEX IF NOT EXISTS attempts_entry
     ON delivery_attempts(entry_id, attempt);
 CREATE INDEX IF NOT EXISTS attempts_queue
     ON delivery_attempts(queue_id, started_at_ms);
+CREATE INDEX IF NOT EXISTS attempts_finished
+    ON delivery_attempts(finished_at_ms, delivery_id);
 CREATE INDEX IF NOT EXISTS entries_ready
     ON entries(queue_id, ready_seq) WHERE state = 'ready';
 CREATE INDEX IF NOT EXISTS entries_inflight
@@ -95,9 +97,14 @@ CREATE INDEX IF NOT EXISTS attempts_entry
     ON delivery_attempts(entry_id, attempt);
 CREATE INDEX IF NOT EXISTS attempts_queue
     ON delivery_attempts(queue_id, started_at_ms);
+CREATE INDEX IF NOT EXISTS attempts_finished
+    ON delivery_attempts(finished_at_ms, delivery_id);
 "#;
 
 pub const DEFAULT_LEASE_MS: u64 = 30_000;
+pub const DEFAULT_HISTORY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const DEFAULT_HISTORY_MAX_ROWS: usize = 1_000_000;
+const HISTORY_PRUNE_BATCH: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -106,6 +113,10 @@ pub struct Options {
     pub max_batch_messages: usize,
     pub max_batch_bytes: usize,
     pub lease_ms: u64,
+    /// Drop finished attempt rows older than this. Zero disables age pruning.
+    pub history_retention_ms: u64,
+    /// Keep at most this many finished attempt rows. Zero disables the cap.
+    pub history_max_rows: usize,
 }
 
 impl Default for Options {
@@ -116,6 +127,8 @@ impl Default for Options {
             max_batch_messages: 256,
             max_batch_bytes: 1024 * 1024,
             lease_ms: DEFAULT_LEASE_MS,
+            history_retention_ms: DEFAULT_HISTORY_RETENTION_MS,
+            history_max_rows: DEFAULT_HISTORY_MAX_ROWS,
         }
     }
 }
@@ -317,6 +330,7 @@ impl Ante {
             _lock: lock,
         };
         ante.recover_startup()?;
+        ante.prune_history()?;
 
         let mut readers = Vec::with_capacity(READER_CONNECTIONS);
         for _ in 0..READER_CONNECTIONS {
@@ -776,6 +790,52 @@ impl Ante {
         Ok(recovered)
     }
 
+    /// Apply the configured attempt-history retention policy.
+    ///
+    /// Unfinished attempts are never removed. A zero retention or row cap
+    /// disables that limit. Each call is bounded to avoid long write stalls.
+    pub fn prune_history(&self) -> Result<u64> {
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let batch = HISTORY_PRUNE_BATCH as i64;
+        let mut removed = 0u64;
+        if self.options.history_retention_ms > 0 {
+            let cutoff = now.saturating_sub(self.options.history_retention_ms);
+            removed += tx.execute(
+                "DELETE FROM delivery_attempts
+                 WHERE delivery_id IN (
+                     SELECT delivery_id FROM delivery_attempts
+                     WHERE finished_at_ms IS NOT NULL AND finished_at_ms < ?1
+                     ORDER BY finished_at_ms, delivery_id
+                     LIMIT ?2
+                 )",
+                params![to_i64(cutoff)?, batch],
+            )? as u64;
+        }
+        if self.options.history_max_rows > 0 {
+            let keep = to_i64(self.options.history_max_rows as u64)?;
+            removed += tx.execute(
+                "DELETE FROM delivery_attempts
+                 WHERE delivery_id IN (
+                     SELECT delivery_id FROM delivery_attempts
+                     WHERE finished_at_ms IS NOT NULL
+                       AND delivery_id NOT IN (
+                           SELECT delivery_id FROM delivery_attempts
+                           WHERE finished_at_ms IS NOT NULL
+                           ORDER BY finished_at_ms DESC, delivery_id DESC
+                           LIMIT ?1
+                       )
+                     ORDER BY finished_at_ms, delivery_id
+                     LIMIT ?2
+                 )",
+                params![keep, batch],
+            )? as u64;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Remove all ready messages from a queue. In-flight messages are untouched.
     pub fn purge(&self, queue: &str) -> Result<u64> {
         let mut writer = self.writer()?;
@@ -1162,6 +1222,10 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<()> {
             "database metadata schema does not match user_version".into(),
         ));
     }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS attempts_finished
+         ON delivery_attempts(finished_at_ms, delivery_id);",
+    )?;
     Ok(())
 }
 

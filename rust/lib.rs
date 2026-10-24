@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
-use ante_core::{AckOutcome, Ante, DeliveryToken, NewMessage, RequeueOutcome, Settlement};
+use ante_core::{AckOutcome, Ante, DeliveryToken, NewMessage, Options, RequeueOutcome, Settlement};
 use ante_security::Security;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -164,8 +164,31 @@ impl From<ante_core::QueueInfo> for Info {
 #[pymethods]
 impl Engine {
     #[new]
-    fn new(py: Python<'_>, path: String) -> PyResult<Self> {
-        let engine = py.allow_threads(|| Ante::open(path)).map_err(error)?;
+    #[pyo3(signature = (path, history_retention_ms=None, history_max_rows=None))]
+    fn new(
+        py: Python<'_>,
+        path: String,
+        history_retention_ms: Option<u64>,
+        history_max_rows: Option<usize>,
+    ) -> PyResult<Self> {
+        let options = if history_retention_ms.is_some() || history_max_rows.is_some() {
+            let mut options = Options::default();
+            if let Some(value) = history_retention_ms {
+                options.history_retention_ms = value;
+            }
+            if let Some(value) = history_max_rows {
+                options.history_max_rows = value;
+            }
+            Some(options)
+        } else {
+            None
+        };
+        let engine = py
+            .allow_threads(|| match options {
+                Some(options) => Ante::open_with(path, options),
+                None => Ante::open(path),
+            })
+            .map_err(error)?;
         Ok(Self {
             inner: RwLock::new(Some(Arc::new(engine))),
             server: Mutex::new(None),
@@ -473,6 +496,10 @@ impl Engine {
 
     fn recover_expired(&self, py: Python<'_>) -> PyResult<u64> {
         self.run(py, |engine| engine.recover_expired())
+    }
+
+    fn prune_history(&self, py: Python<'_>) -> PyResult<u64> {
+        self.run(py, |engine| engine.prune_history())
     }
 
     fn purge(&self, py: Python<'_>, queue: String) -> PyResult<u64> {

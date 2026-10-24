@@ -83,6 +83,20 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(self.ante.message_status("jobs", job_id)["state"], "discarded")
         self.assertEqual(self.ante.info("failed")["ready"], 1)
 
+    def test_history_retention_can_be_configured(self):
+        with tempfile.TemporaryDirectory(prefix="ante-retention-") as directory:
+            path = Path(directory) / "ante.sqlite3"
+            with Ante.open(
+                path, history_retention_ms=1, history_max_rows=0
+            ) as ante:
+                ante.declare("jobs")
+                message_id = ante.publish("jobs", {"n": 1})
+                [delivery] = ante.take("jobs", max=1, wait_ms=1000)
+                delivery.ack()
+                time.sleep(0.01)
+                self.assertEqual(ante.prune_history(), 1)
+                self.assertIsNone(ante.message_status("jobs", message_id))
+
     def test_publish_batch(self):
         ids = self.ante.publish_batch("jobs", [{"n": 1}, {"n": 2}, {"n": 3}])
         self.assertEqual(len(ids), 3)

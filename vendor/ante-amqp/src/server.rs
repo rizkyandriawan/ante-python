@@ -100,6 +100,7 @@ async fn serve_loop(
 ) -> io::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticks = 0u64;
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let registry = Arc::new(ConsumerRegistry::default());
     let channel_registry = Arc::new(ChannelRegistry::default());
@@ -111,12 +112,19 @@ async fn serve_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                ticks = ticks.wrapping_add(1);
+                let prune = ticks.is_multiple_of(60);
                 let ante = ante.clone();
                 let guard = drain.begin();
                 tokio::task::spawn_blocking(move || {
                     let _guard = guard;
                     if let Err(err) = ante.recover_expired() {
                         eprintln!("ante-amqp: lease recovery failed: {err}");
+                    }
+                    if prune {
+                        if let Err(err) = ante.prune_history() {
+                            eprintln!("ante-amqp: history prune failed: {err}");
+                        }
                     }
                 });
             }
