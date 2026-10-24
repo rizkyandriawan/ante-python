@@ -92,9 +92,24 @@ class Ante:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
-    def serve_amqp(self, host: str = "127.0.0.1", port: int = 5672) -> tuple[str, int]:
-        """Listen for AMQP clients on the same embedded queue engine."""
-        return self._call("serve_amqp", host, port)
+    def serve_amqp(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 5672,
+        *,
+        security_path: str | os.PathLike[str] | None = None,
+    ) -> tuple[str, int]:
+        """Listen for AMQP clients on the same embedded queue engine.
+
+        Passing ``security_path`` enables TLS, credential authentication, and
+        queue-scoped permissions from the JSON security file.
+        """
+        return self._call(
+            "serve_amqp",
+            host,
+            port,
+            None if security_path is None else os.fspath(security_path),
+        )
 
     def stop_amqp(self) -> None:
         self._call("stop_amqp")

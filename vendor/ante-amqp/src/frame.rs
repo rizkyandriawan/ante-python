@@ -72,6 +72,7 @@ pub const CONFIRM_SELECT: u16 = 10;
 pub const CONFIRM_SELECT_OK: u16 = 11;
 
 pub const REPLY_SUCCESS: u16 = 200;
+pub const REPLY_ACCESS_REFUSED: u16 = 403;
 pub const REPLY_NOT_FOUND: u16 = 404;
 pub const REPLY_PRECONDITION_FAILED: u16 = 406;
 pub const REPLY_FRAME_ERROR: u16 = 501;

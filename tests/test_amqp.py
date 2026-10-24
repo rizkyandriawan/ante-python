@@ -30,8 +30,12 @@ class AmqpTests(unittest.TestCase):
                     channel.basic_ack(method.delivery_tag)
                 finally:
                     connection.close()
-                with self.assertRaises(AnteError):
+                with self.assertRaises(AnteError) as error:
                     ante.serve_amqp(port=0)
+                self.assertEqual(error.exception.code, "AMQP")
+                with self.assertRaises(AnteError) as error:
+                    ante.serve_amqp(port=0, security_path="/missing-security.json")
+                self.assertEqual(error.exception.code, "SECURITY")
                 ante.stop_amqp()
                 ante.serve_amqp(port=port)
             with Ante.open(path) as reopened:

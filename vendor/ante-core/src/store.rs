@@ -665,6 +665,31 @@ impl Ante {
         Ok(Some((ready_entries.len() + inflight_entries.len()) as u64))
     }
 
+    /// Queue name that owns an in-flight delivery token.
+    ///
+    /// Returns `None` for unknown or stale tokens. Used by network adapters to
+    /// authorize settlement without trusting the client-provided token.
+    pub fn queue_for_token(&self, token: &DeliveryToken) -> Result<Option<String>> {
+        let db = self.db()?;
+        let read = db.begin_read()?;
+        let inflight = read.open_table(INFLIGHT)?;
+        let Some(raw) = inflight.get(token.message_id)? else {
+            return Ok(None);
+        };
+        let record = DeliveryRecord::decode(raw.value())?;
+        if record.delivery_id != token.delivery_id {
+            return Ok(None);
+        }
+        let queues = read.open_table(QUEUES)?;
+        for entry in queues.iter()? {
+            let (name, id) = entry?;
+            if id.value() == record.queue_id {
+                return Ok(Some(name.value().to_string()));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn info(&self, queue: &str) -> Result<QueueInfo> {
         let db = self.db()?;
         let read = db.begin_read()?;

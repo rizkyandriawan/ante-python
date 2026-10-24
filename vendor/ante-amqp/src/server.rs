@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ante_core::{Ante, DeliveryToken, Error, NewMessage};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use ante_security::{BoxedStream, Permission, Principal, Security, TlsAcceptor};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, ReadHalf, WriteHalf};
+use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 
 use crate::frame::{
@@ -23,9 +23,9 @@ use crate::frame::{
     EXCHANGE_DECLARE, EXCHANGE_DELETE, EXCHANGE_DELETE_OK, FRAME_BODY, FRAME_HEADER,
     FRAME_HEARTBEAT, FRAME_METHOD, QUEUE_BIND, QUEUE_BIND_OK, QUEUE_DECLARE, QUEUE_DECLARE_OK,
     QUEUE_DELETE, QUEUE_DELETE_OK, QUEUE_PURGE, QUEUE_PURGE_OK, QUEUE_UNBIND, QUEUE_UNBIND_OK,
-    REPLY_CHANNEL_ERROR, REPLY_COMMAND_INVALID, REPLY_FRAME_ERROR, REPLY_NOT_ALLOWED,
-    REPLY_NOT_FOUND, REPLY_NOT_IMPLEMENTED, REPLY_NO_ROUTE, REPLY_PRECONDITION_FAILED,
-    REPLY_UNEXPECTED_FRAME,
+    REPLY_ACCESS_REFUSED, REPLY_CHANNEL_ERROR, REPLY_COMMAND_INVALID, REPLY_FRAME_ERROR,
+    REPLY_NOT_ALLOWED, REPLY_NOT_FOUND, REPLY_NOT_IMPLEMENTED, REPLY_NO_ROUTE,
+    REPLY_PRECONDITION_FAILED, REPLY_UNEXPECTED_FRAME,
 };
 
 const SERVER_FRAME_MAX: u32 = 131_072;
@@ -68,6 +68,27 @@ pub async fn serve_until_with_options(
     listener: TcpListener,
     ante: Arc<Ante>,
     options: ServerOptions,
+    shutdown: oneshot::Receiver<()>,
+) -> io::Result<()> {
+    serve_loop(listener, ante, options, None, shutdown).await
+}
+
+/// Serve AMQP over TLS with credential authentication and queue permissions.
+pub async fn serve_secure_until_with_options(
+    listener: TcpListener,
+    ante: Arc<Ante>,
+    options: ServerOptions,
+    security: Arc<Security>,
+    shutdown: oneshot::Receiver<()>,
+) -> io::Result<()> {
+    serve_loop(listener, ante, options, Some(security), shutdown).await
+}
+
+async fn serve_loop(
+    listener: TcpListener,
+    ante: Arc<Ante>,
+    options: ServerOptions,
+    security: Option<Arc<Security>>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -100,6 +121,7 @@ pub async fn serve_until_with_options(
                         continue;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 let setup = ConnectionSetup {
                     ante: ante.clone(),
                     lease_ms: options.lease_ms,
@@ -108,10 +130,36 @@ pub async fn serve_until_with_options(
                     queue_locks: queue_locks.clone(),
                     drain: drain.clone(),
                     reaper: reaper.clone(),
+                    security: security.clone(),
                 };
                 let stop = stop_rx.clone();
+                let acceptor = security
+                    .as_ref()
+                    .map(|security| TlsAcceptor::from(security.tls_config()));
                 connections.spawn(async move {
-                    if let Err(err) = handle_connection(stream, setup, stop).await {
+                    let result = match acceptor {
+                        Some(acceptor) => {
+                            let stream = match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                acceptor.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(stream)) => stream,
+                                Ok(Err(err)) => {
+                                    eprintln!("ante-amqp: TLS handshake failed from {peer}: {err}");
+                                    return;
+                                }
+                                Err(_) => {
+                                    eprintln!("ante-amqp: TLS handshake timed out from {peer}");
+                                    return;
+                                }
+                            };
+                            handle_connection(Box::new(stream), setup, stop).await
+                        }
+                        None => handle_connection(Box::new(stream), setup, stop).await,
+                    };
+                    if let Err(err) = result {
                         if err.kind() != io::ErrorKind::UnexpectedEof {
                             eprintln!("ante-amqp: connection {peer} closed: {err}");
                         }
@@ -154,8 +202,11 @@ pub async fn serve_until_with_options(
     Ok(())
 }
 
+type StreamRead = ReadHalf<BoxedStream>;
+type StreamWrite = WriteHalf<BoxedStream>;
+
 struct FrameWriter {
-    inner: BufWriter<OwnedWriteHalf>,
+    inner: BufWriter<StreamWrite>,
     frame_max: usize,
 }
 
@@ -198,6 +249,8 @@ struct Shared {
     registrations: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
     client_cancel_notify: AtomicBool,
     drain: Drain,
+    security: Option<Arc<Security>>,
+    principal: std::sync::RwLock<Option<Principal>>,
 }
 
 impl Drop for Shared {
@@ -703,15 +756,15 @@ struct ConnectionSetup {
     queue_locks: Arc<QueueLocks>,
     drain: Drain,
     reaper: ConsumerReaper,
+    security: Option<Arc<Security>>,
 }
 
 async fn handle_connection(
-    stream: TcpStream,
+    stream: BoxedStream,
     setup: ConnectionSetup,
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
-    stream.set_nodelay(true)?;
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let channels = Arc::new(Mutex::new(HashMap::new()));
     setup.channel_registry.add(&channels);
@@ -734,6 +787,8 @@ async fn handle_connection(
         registrations: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         client_cancel_notify: AtomicBool::new(false),
         drain: setup.drain,
+        security: setup.security,
+        principal: std::sync::RwLock::new(None),
     });
 
     let result = run_connection(&mut reader, &shared, stop).await;
@@ -743,11 +798,24 @@ async fn handle_connection(
 }
 
 async fn run_connection(
-    reader: &mut BufReader<OwnedReadHalf>,
+    reader: &mut BufReader<StreamRead>,
     shared: &Arc<Shared>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
-    if !handshake(reader, shared).await? {
+    let ok = if shared.security.is_some() {
+        match tokio::time::timeout(Duration::from_secs(10), handshake(reader, shared)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "authentication handshake timed out",
+                ))
+            }
+        }
+    } else {
+        handshake(reader, shared).await?
+    };
+    if !ok {
         return Ok(());
     }
 
@@ -792,10 +860,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-async fn handshake(
-    reader: &mut BufReader<OwnedReadHalf>,
-    shared: &Arc<Shared>,
-) -> io::Result<bool> {
+async fn handshake(reader: &mut BufReader<StreamRead>, shared: &Arc<Shared>) -> io::Result<bool> {
     let mut protocol_header = [0u8; 8];
     reader.read_exact(&mut protocol_header).await?;
     if protocol_header != *b"AMQP\x00\x00\x09\x01" {
@@ -821,7 +886,11 @@ async fn handshake(
                 ]),
             ),
         ]);
-        args.longstr(b"PLAIN AMQPLAIN");
+        if shared.security.is_some() {
+            args.longstr(b"PLAIN");
+        } else {
+            args.longstr(b"PLAIN AMQPLAIN");
+        }
         args.longstr(b"en_US");
         let mut writer = shared.writer.lock().await;
         writer
@@ -838,9 +907,39 @@ async fn handshake(
             table_flag(&client_properties, "capabilities", "consumer_cancel_notify"),
             Ordering::Relaxed,
         );
-        parser.shortstr()?;
-        parser.longstr_bytes()?;
-        parser.shortstr()?;
+        let mechanism = parser.shortstr()?;
+        let response = parser.longstr_bytes()?;
+        let _locale = parser.shortstr()?;
+        parser.finish()?;
+        if let Some(security) = &shared.security {
+            let principal = match parse_plain(&mechanism, &response) {
+                Some((username, password)) => {
+                    let security = Arc::clone(security);
+                    let username = username.to_string();
+                    let password = password.to_string();
+                    tokio::task::spawn_blocking(move || security.authenticate(&username, &password))
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                None => None,
+            };
+            let Some(principal) = principal else {
+                send_connection_close(
+                    shared,
+                    REPLY_ACCESS_REFUSED,
+                    "authentication failed",
+                    CLASS_CONNECTION,
+                    CONNECTION_START_OK,
+                )
+                .await?;
+                return Ok(false);
+            };
+            *shared
+                .principal
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(principal);
+        }
     }
 
     {
@@ -877,9 +976,21 @@ async fn handshake(
     let open = read_expected(reader, shared, CLASS_CONNECTION, CONNECTION_OPEN).await?;
     {
         let mut parser = Parser::new(&open);
-        parser.shortstr()?;
-        parser.shortstr()?;
+        let vhost = parser.shortstr()?;
+        let _capabilities = parser.shortstr()?;
         parser.u8()?;
+        parser.finish()?;
+        if shared.security.is_some() && vhost != "/" {
+            send_connection_close(
+                shared,
+                REPLY_NOT_ALLOWED,
+                "only the default virtual host is supported",
+                CLASS_CONNECTION,
+                CONNECTION_OPEN,
+            )
+            .await?;
+            return Ok(false);
+        }
     }
 
     let mut args = Encoder::new();
@@ -891,8 +1002,60 @@ async fn handshake(
     Ok(true)
 }
 
+/// Decode the SASL PLAIN payload: `[authzid] NUL authcid NUL passwd`.
+fn parse_plain<'a>(mechanism: &str, response: &'a [u8]) -> Option<(&'a str, &'a str)> {
+    if !mechanism.eq_ignore_ascii_case("PLAIN") {
+        return None;
+    }
+    let mut parts = response.split(|byte| *byte == 0);
+    let _authzid = parts.next()?;
+    let username = std::str::from_utf8(parts.next()?).ok()?;
+    let password = std::str::from_utf8(parts.next()?).ok()?;
+    if parts.next().is_some() || username.is_empty() {
+        return None;
+    }
+    Some((username, password))
+}
+
+fn authorized(shared: &Shared, permission: Permission, queue: &str) -> bool {
+    let Some(security) = &shared.security else {
+        return true;
+    };
+    let principal = shared
+        .principal
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    security.allows(principal.as_ref(), permission, queue)
+}
+
+async fn require_access(
+    shared: &Arc<Shared>,
+    channel: u16,
+    permission: Permission,
+    queue: &str,
+    class_id: u16,
+    method_id: u16,
+) -> io::Result<bool> {
+    if authorized(shared, permission, queue) {
+        return Ok(true);
+    }
+    channel_error(
+        shared,
+        channel,
+        REPLY_ACCESS_REFUSED,
+        &format!(
+            "permission denied: {} on queue {queue}",
+            permission.as_str()
+        ),
+        class_id,
+        method_id,
+    )
+    .await?;
+    Ok(false)
+}
+
 async fn read_expected(
-    reader: &mut BufReader<OwnedReadHalf>,
+    reader: &mut BufReader<StreamRead>,
     shared: &Arc<Shared>,
     expected_class: u16,
     expected_method: u16,
@@ -1063,6 +1226,18 @@ async fn handle_method(shared: &Arc<Shared>, frame: Frame) -> io::Result<bool> {
             let exchange = parser.shortstr()?;
             let _routing_key = parser.shortstr()?;
             let no_wait = parser.u8().map(|bits| bits & 1 != 0).unwrap_or(false);
+            if !require_access(
+                shared,
+                channel,
+                Permission::Inspect,
+                &queue,
+                class_id,
+                method_id,
+            )
+            .await?
+            {
+                return Ok(false);
+            }
             if !exchange.is_empty() {
                 channel_error(
                     shared,
@@ -1091,6 +1266,18 @@ async fn handle_method(shared: &Arc<Shared>, frame: Frame) -> io::Result<bool> {
             let mut parser = Parser::new(&args);
             let _reserved = parser.short()?;
             let queue = parser.shortstr()?;
+            if !require_access(
+                shared,
+                channel,
+                Permission::Inspect,
+                &queue,
+                class_id,
+                method_id,
+            )
+            .await?
+            {
+                return Ok(false);
+            }
             let mut out = Encoder::new();
             out.shortstr(&queue);
             shared
@@ -1106,6 +1293,18 @@ async fn handle_method(shared: &Arc<Shared>, frame: Frame) -> io::Result<bool> {
             let _reserved = parser.short()?;
             let queue = parser.shortstr()?;
             let no_wait = parser.u8().map(|bits| bits & 1 != 0).unwrap_or(false);
+            if !require_access(
+                shared,
+                channel,
+                Permission::Purge,
+                &queue,
+                class_id,
+                method_id,
+            )
+            .await?
+            {
+                return Ok(false);
+            }
             let ante = shared.ante.clone();
             let count = match blocking(&shared.drain, move || ante.purge(&queue)).await {
                 Ok(count) => count,
@@ -1143,6 +1342,18 @@ async fn handle_method(shared: &Arc<Shared>, frame: Frame) -> io::Result<bool> {
             let if_unused = bits & 1 != 0;
             let if_empty = bits & 2 != 0;
             let no_wait = bits & 4 != 0;
+            if !require_access(
+                shared,
+                channel,
+                Permission::Delete,
+                &queue,
+                class_id,
+                method_id,
+            )
+            .await?
+            {
+                return Ok(false);
+            }
 
             let lifecycle = shared.queue_locks.get(&queue);
             let lifecycle_guard = lifecycle.lock().await;
@@ -1332,18 +1543,6 @@ async fn handle_method(shared: &Arc<Shared>, frame: Frame) -> io::Result<bool> {
             let bits = parser.u8()?;
             parser.finish()?;
             let mandatory = bits & 1 != 0;
-            if !exchange.is_empty() {
-                channel_error(
-                    shared,
-                    channel,
-                    REPLY_NOT_IMPLEMENTED,
-                    "named exchanges are not supported",
-                    class_id,
-                    method_id,
-                )
-                .await?;
-                return Ok(false);
-            }
             let mut channels = shared.channels.lock().await;
             let Some(state) = channels.get_mut(&channel) else {
                 drop(channels);
@@ -1398,7 +1597,9 @@ async fn handle_method(shared: &Arc<Shared>, frame: Frame) -> io::Result<bool> {
             Ok(false)
         }
         (CLASS_BASIC, BASIC_RECOVER) => {
-            recover_channel(shared, channel).await;
+            if !recover_channel(shared, channel).await? {
+                return Ok(false);
+            }
             shared
                 .writer
                 .lock()
@@ -1460,6 +1661,23 @@ async fn handle_queue_declare(shared: &Arc<Shared>, channel: u16, args: &[u8]) -
         .await?;
         return Ok(());
     }
+    let permission = if passive {
+        Permission::Inspect
+    } else {
+        Permission::Declare
+    };
+    if !require_access(
+        shared,
+        channel,
+        permission,
+        &queue,
+        CLASS_QUEUE,
+        QUEUE_DECLARE,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     let ante = shared.ante.clone();
     let queue_for_call = queue.clone();
@@ -1519,6 +1737,18 @@ async fn handle_consume(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::
     parser.skip_table()?;
     let no_ack = bits & 0x02 != 0;
     let no_wait = bits & 0x08 != 0;
+    if !require_access(
+        shared,
+        channel,
+        Permission::Consume,
+        &queue,
+        CLASS_BASIC,
+        BASIC_CONSUME,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     let lifecycle = shared.queue_locks.get(&queue);
     let lifecycle_guard = lifecycle.lock().await;
@@ -2297,7 +2527,31 @@ async fn finish_publish(
     channel: u16,
     pending: PendingPublish,
 ) -> io::Result<()> {
+    if !pending.exchange.is_empty() {
+        channel_error(
+            shared,
+            channel,
+            REPLY_NOT_IMPLEMENTED,
+            "named exchanges are not supported",
+            CLASS_BASIC,
+            BASIC_PUBLISH,
+        )
+        .await?;
+        return Ok(());
+    }
     let queue = pending.routing_key.clone();
+    if !require_access(
+        shared,
+        channel,
+        Permission::Publish,
+        &queue,
+        CLASS_BASIC,
+        BASIC_PUBLISH,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let ante = shared.ante.clone();
     let queue_for_check = queue.clone();
     let exists = blocking(&shared.drain, move || ante.queue_exists(&queue_for_check))
@@ -2378,6 +2632,18 @@ async fn handle_get(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::Resu
     let _reserved = parser.short()?;
     let queue = parser.shortstr()?;
     let no_ack = parser.u8().map(|bits| bits & 1 != 0).unwrap_or(false);
+    if !require_access(
+        shared,
+        channel,
+        Permission::Consume,
+        &queue,
+        CLASS_BASIC,
+        BASIC_GET,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     // Serialize with queue deletion: the take and the outstanding insertion
     // must be one lifecycle step, otherwise cleanup can run in between.
@@ -2518,16 +2784,16 @@ async fn handle_ack(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::Resu
         return Ok(());
     };
     let delivery_guard = delivery_lock.lock().await;
-    let tokens = {
+    let keys = {
         let mut channels = shared.channels.lock().await;
         let Some(state) = channels.get_mut(&channel) else {
             return Ok(());
         };
         state.prune_expired(now_ms());
-        take_outstanding(state, tag, multiple)
+        settle_keys(state, tag, multiple)
     };
-    drop(delivery_guard);
-    let Some(tokens) = tokens else {
+    let Some(keys) = keys else {
+        drop(delivery_guard);
         channel_error(
             shared,
             channel,
@@ -2539,9 +2805,44 @@ async fn handle_ack(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::Resu
         .await?;
         return Ok(());
     };
-    if tokens.is_empty() {
+    if keys.is_empty() {
         return Ok(());
     }
+    let denied = {
+        let channels = shared.channels.lock().await;
+        channels.get(&channel).is_some_and(|state| {
+            keys.iter().any(|key| {
+                state
+                    .outstanding
+                    .get(key)
+                    .is_some_and(|entry| !authorized(shared, Permission::Consume, &entry.queue))
+            })
+        })
+    };
+    if denied {
+        drop(delivery_guard);
+        channel_error(
+            shared,
+            channel,
+            REPLY_ACCESS_REFUSED,
+            "permission denied: consume on outstanding queue",
+            CLASS_BASIC,
+            BASIC_ACK,
+        )
+        .await?;
+        return Ok(());
+    }
+    let tokens = {
+        let mut channels = shared.channels.lock().await;
+        let Some(state) = channels.get_mut(&channel) else {
+            return Ok(());
+        };
+        remove_keys(state, &keys)
+            .into_iter()
+            .map(|(token, _)| token)
+            .collect::<Vec<_>>()
+    };
+    drop(delivery_guard);
     let ante = shared.ante.clone();
     if let Err(err) = blocking(&shared.drain, move || ante.ack_batch(&tokens)).await {
         eprintln!("ante-amqp: ack failed: {err}");
@@ -2549,47 +2850,57 @@ async fn handle_ack(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::Resu
     Ok(())
 }
 
-fn take_outstanding(
-    state: &mut ChannelState,
-    tag: u64,
-    multiple: bool,
-) -> Option<Vec<DeliveryToken>> {
+fn settle_keys(state: &ChannelState, tag: u64, multiple: bool) -> Option<Vec<u64>> {
     if multiple {
-        let keys: Vec<u64> = if tag == 0 {
-            state
-                .outstanding
-                .iter()
-                .filter(|(_, entry)| entry.sent)
-                .map(|(key, _)| *key)
-                .collect()
+        if tag == 0 {
+            Some(
+                state
+                    .outstanding
+                    .iter()
+                    .filter(|(_, entry)| entry.sent)
+                    .map(|(key, _)| *key)
+                    .collect(),
+            )
         } else {
             match state.outstanding.get(&tag) {
                 Some(entry) if entry.sent => {}
                 _ => return None,
             }
-            state
-                .outstanding
-                .range(..=tag)
-                .filter(|(_, entry)| entry.sent)
-                .map(|(key, _)| *key)
-                .collect()
-        };
-        let mut tokens = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(entry) = state.outstanding.remove(&key) {
-                tokens.push(entry.token);
-            }
+            Some(
+                state
+                    .outstanding
+                    .range(..=tag)
+                    .filter(|(_, entry)| entry.sent)
+                    .map(|(key, _)| *key)
+                    .collect(),
+            )
         }
-        Some(tokens)
     } else {
         match state.outstanding.get(&tag) {
-            Some(entry) if entry.sent => state
-                .outstanding
-                .remove(&tag)
-                .map(|entry| vec![entry.token]),
+            Some(entry) if entry.sent => Some(vec![tag]),
             _ => None,
         }
     }
+}
+
+fn remove_keys(state: &mut ChannelState, keys: &[u64]) -> Vec<(DeliveryToken, String)> {
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Some(entry) = state.outstanding.remove(key) {
+            entries.push((entry.token, entry.queue));
+        }
+    }
+    entries
+}
+
+#[cfg(test)]
+fn take_outstanding(
+    state: &mut ChannelState,
+    tag: u64,
+    multiple: bool,
+) -> Option<Vec<(DeliveryToken, String)>> {
+    let keys = settle_keys(state, tag, multiple)?;
+    Some(remove_keys(state, &keys))
 }
 
 async fn channel_delivery_lock(
@@ -2622,16 +2933,16 @@ async fn handle_reject(
         return Ok(());
     };
     let delivery_guard = delivery_lock.lock().await;
-    let tokens = {
+    let keys = {
         let mut channels = shared.channels.lock().await;
         let Some(state) = channels.get_mut(&channel) else {
             return Ok(());
         };
         state.prune_expired(now_ms());
-        take_outstanding(state, tag, multiple)
+        settle_keys(state, tag, multiple)
     };
-    drop(delivery_guard);
-    let Some(tokens) = tokens else {
+    let Some(keys) = keys else {
+        drop(delivery_guard);
         channel_error(
             shared,
             channel,
@@ -2643,10 +2954,42 @@ async fn handle_reject(
         .await?;
         return Ok(());
     };
+    let denied = {
+        let channels = shared.channels.lock().await;
+        channels.get(&channel).is_some_and(|state| {
+            keys.iter().any(|key| {
+                state
+                    .outstanding
+                    .get(key)
+                    .is_some_and(|entry| !authorized(shared, Permission::Consume, &entry.queue))
+            })
+        })
+    };
+    if denied {
+        drop(delivery_guard);
+        channel_error(
+            shared,
+            channel,
+            REPLY_ACCESS_REFUSED,
+            "permission denied: consume on outstanding queue",
+            CLASS_BASIC,
+            BASIC_REJECT,
+        )
+        .await?;
+        return Ok(());
+    }
+    let entries = {
+        let mut channels = shared.channels.lock().await;
+        let Some(state) = channels.get_mut(&channel) else {
+            return Ok(());
+        };
+        remove_keys(state, &keys)
+    };
+    drop(delivery_guard);
 
     let ante = shared.ante.clone();
     let _ = blocking(&shared.drain, move || {
-        for token in tokens {
+        for (token, _) in entries {
             if requeue {
                 ante.requeue(&token)?;
             } else {
@@ -2659,38 +3002,58 @@ async fn handle_reject(
     Ok(())
 }
 
-async fn recover_channel(shared: &Arc<Shared>, channel: u16) {
+async fn recover_channel(shared: &Arc<Shared>, channel: u16) -> io::Result<bool> {
     let Some(delivery_lock) = channel_delivery_lock(&shared.channels, channel).await else {
-        return;
+        return Ok(true);
     };
     let delivery_guard = delivery_lock.lock().await;
-    let tokens = {
+    let entries = {
         let mut channels = shared.channels.lock().await;
         match channels.get_mut(&channel) {
             Some(state) => {
-                let tokens: Vec<DeliveryToken> = state
+                let entries: Vec<(DeliveryToken, String)> = state
                     .outstanding
                     .values()
-                    .map(|entry| entry.token.clone())
+                    .map(|entry| (entry.token.clone(), entry.queue.clone()))
                     .collect();
-                state.outstanding.clear();
-                tokens
+                if entries
+                    .iter()
+                    .any(|(_, queue)| !authorized(shared, Permission::Consume, queue))
+                {
+                    None
+                } else {
+                    state.outstanding.clear();
+                    Some(entries)
+                }
             }
-            None => Vec::new(),
+            None => Some(Vec::new()),
         }
     };
     drop(delivery_guard);
-    if tokens.is_empty() {
-        return;
+    let Some(entries) = entries else {
+        channel_error(
+            shared,
+            channel,
+            REPLY_ACCESS_REFUSED,
+            "permission denied: consume on outstanding queue",
+            CLASS_BASIC,
+            BASIC_RECOVER,
+        )
+        .await?;
+        return Ok(false);
+    };
+    if entries.is_empty() {
+        return Ok(true);
     }
     let ante = shared.ante.clone();
     let _ = blocking(&shared.drain, move || {
-        for token in tokens {
+        for (token, _) in entries {
             ante.requeue(&token)?;
         }
         Ok(())
     })
     .await;
+    Ok(true)
 }
 
 async fn channel_error(
@@ -2950,7 +3313,7 @@ mod tests {
         assert_eq!(
             tokens
                 .iter()
-                .map(|token| token.message_id)
+                .map(|(token, _)| token.message_id)
                 .collect::<Vec<_>>(),
             vec![1, 3]
         );

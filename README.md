@@ -182,8 +182,23 @@ with Ante.open() as ante:
 
 Plain `Ante.open()` still opens no socket. The listener supports Ante's AMQP
 subset (default exchange, durable queues, confirms, manual ack/nack, prefetch),
-not the complete RabbitMQ broker feature set. It has no authentication or TLS;
-the default bind address is loopback. Use port `0` for an OS-assigned port.
+not the complete RabbitMQ broker feature set. Its default profile is plaintext
+and unauthenticated on loopback.
+
+For TLS and queue-scoped credentials, pass a security file:
+
+```python
+with Ante.open() as ante:
+    host, port = ante.serve_amqp(
+        "127.0.0.1", 5671, security_path="/etc/myapp/security.json"
+    )
+```
+
+The file is loaded before the socket binds; a users configuration without TLS is
+rejected, and secure mode has no plaintext fallback. The JSON schema, permission
+matrix, Argon2id hash generation, and client examples are documented in Ante's
+[security guide](https://github.com/rizkyandriawan/ante/blob/main/docs/security.md).
+Use port `0` for an OS-assigned port.
 
 ## Development / verification
 
@@ -203,6 +218,7 @@ maturin build --release
 maturin sdist
 ```
 
-`vendor/ante-core` is the MIT-licensed Rust engine copied from Ante; its source
-and tests are unchanged. See `vendor/README.md` for provenance. The copy makes
-this repository build independently of a sibling Ante checkout.
+`vendor/ante-core`, `vendor/ante-amqp`, and `vendor/ante-security` are
+MIT-licensed Rust crates copied from Ante; their sources and tests are unchanged.
+See `vendor/README.md` for provenance. The copies make this repository build
+independently of a sibling Ante checkout.

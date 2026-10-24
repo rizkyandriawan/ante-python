@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use ante_core::{AckOutcome, Ante, DeliveryToken, NewMessage, RequeueOutcome};
+use ante_security::Security;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -142,8 +143,21 @@ impl Engine {
         })
     }
 
-    fn serve_amqp(&self, py: Python<'_>, host: String, port: u16) -> PyResult<(String, u16)> {
+    #[pyo3(signature = (host, port, security_path=None))]
+    fn serve_amqp(
+        &self,
+        py: Python<'_>,
+        host: String,
+        port: u16,
+        security_path: Option<String>,
+    ) -> PyResult<(String, u16)> {
         py.allow_threads(|| {
+            let security = match security_path {
+                Some(path) => Some(Arc::new(Security::load(&path).map_err(|error| {
+                    NativeError::new_err(("SECURITY", error.to_string()))
+                })?)),
+                None => None,
+            };
             let guard = self
                 .inner
                 .read()
@@ -178,7 +192,19 @@ impl Engine {
                 .spawn(move || {
                     runtime.block_on(async move {
                         let listener = tokio::net::TcpListener::from_std(listener)?;
-                        ante_amqp::serve_until(listener, engine, shutdown).await
+                        match security {
+                            Some(security) => {
+                                ante_amqp::serve_secure_until_with_options(
+                                    listener,
+                                    engine,
+                                    ante_amqp::ServerOptions::default(),
+                                    security,
+                                    shutdown,
+                                )
+                                .await
+                            }
+                            None => ante_amqp::serve_until(listener, engine, shutdown).await,
+                        }
                     })
                 })
                 .map_err(|e| NativeError::new_err(("AMQP", e.to_string())))?;

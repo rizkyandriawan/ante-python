@@ -8,4 +8,6 @@
 pub mod frame;
 pub mod server;
 
-pub use server::{serve, serve_until, serve_until_with_options, ServerOptions};
+pub use server::{
+    serve, serve_secure_until_with_options, serve_until, serve_until_with_options, ServerOptions,
+};
