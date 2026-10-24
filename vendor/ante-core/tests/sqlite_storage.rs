@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ante_core::{Ante, Error, NewMessage};
@@ -101,4 +102,80 @@ fn purge_does_not_remove_inflight_entries() {
         ante.ack(&delivery.token).unwrap(),
         ante_core::AckOutcome::Unknown
     );
+}
+
+#[test]
+fn invalid_batch_stores_nothing() {
+    let temp = TempDir::new();
+    let options = ante_core::Options {
+        max_payload_bytes: 4,
+        ..ante_core::Options::default()
+    };
+    let ante = Ante::open_with(temp.path.join("ante.sqlite3"), options).unwrap();
+    ante.declare_queue("jobs").unwrap();
+
+    let error = ante
+        .publish_batch("jobs", vec![message(b"ok"), message(b"too-large")])
+        .unwrap_err();
+    assert!(matches!(error, Error::PayloadTooLarge { .. }));
+    assert_eq!(ante.info("jobs").unwrap().total(), 0);
+}
+
+#[test]
+fn ack_batch_reports_stale_and_unknown_without_settling_them() {
+    let temp = TempDir::new();
+    let ante = Ante::open(temp.path.join("ante.sqlite3")).unwrap();
+    ante.declare_queue("jobs").unwrap();
+    ante.publish("jobs", message(b"one")).unwrap();
+    let first = ante.take("jobs", 1, 30_000).unwrap().remove(0);
+    ante.requeue(&first.token).unwrap();
+    let second = ante.take("jobs", 1, 30_000).unwrap().remove(0);
+
+    let missing = ante_core::DeliveryToken {
+        message_id: 999_999,
+        delivery_id: 1,
+    };
+    let outcomes = ante
+        .ack_batch(&[first.token, missing, second.token])
+        .unwrap();
+    assert_eq!(
+        outcomes,
+        vec![
+            ante_core::AckOutcome::Stale,
+            ante_core::AckOutcome::Unknown,
+            ante_core::AckOutcome::Acked,
+        ]
+    );
+    assert_eq!(ante.info("jobs").unwrap().total(), 0);
+}
+
+#[test]
+fn crash_child() {
+    let Ok(path) = std::env::var("ANTE_CRASH_DB") else {
+        return;
+    };
+    let ante = Ante::open(path).unwrap();
+    ante.declare_queue("jobs").unwrap();
+    ante.publish("jobs", message(b"survives")).unwrap();
+    let _ = ante.take("jobs", 1, 30_000).unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn confirmed_publish_survives_process_exit() {
+    let temp = TempDir::new();
+    let path = temp.path.join("ante.sqlite3");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "crash_child", "--nocapture"])
+        .env("ANTE_CRASH_DB", &path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let ante = Ante::open(&path).unwrap();
+    let info = ante.info("jobs").unwrap();
+    assert_eq!(info.ready, 1);
+    assert_eq!(info.inflight, 0);
+    let delivery = ante.take("jobs", 1, 30_000).unwrap().remove(0);
+    assert_eq!(delivery.payload, b"survives");
 }
