@@ -56,6 +56,15 @@ class Delivery:
         self._ante.requeue(self.token)
         self._settled = True
 
+    def discard(self) -> None:
+        """Remove the delivery without treating it as successful."""
+        if self._settled:
+            return
+        outcome = self._ante._call("discard", self.token)
+        if outcome != "OK":
+            raise AnteError(outcome, "cannot discard delivery")
+        self._settled = True
+
 
 Handler = Callable[[Any, Delivery], None]
 ErrorPolicy = Callable[[BaseException, Delivery], str]
@@ -204,11 +213,40 @@ class Ante:
             raise AnteError(outcome, "cannot requeue delivery")
         self._wake.set()
 
+    def discard(self, token: str) -> None:
+        outcome = self._call("discard", token)
+        if outcome != "OK":
+            raise AnteError(outcome, "cannot discard delivery")
+
     def info(self, queue: str) -> dict[str, Any]:
         return _info(self._call("info", queue))
 
     def list_queues(self) -> list[dict[str, Any]]:
         return [_info(info) for info in self._call("list_queues")]
+
+    def message_status(self, queue: str, message_id: int) -> dict[str, Any] | None:
+        """Return the current state and retained attempt history for a message."""
+        status = self._call("message_status", queue, message_id)
+        if status is None:
+            return None
+        return {
+            "queue": status.queue,
+            "message_id": status.message_id,
+            "state": status.state,
+            "attempts": status.attempts,
+            "created_at_ms": status.created_at_ms,
+            "updated_at_ms": status.updated_at_ms,
+            "history": [
+                {
+                    "attempt": attempt.attempt,
+                    "delivery_id": attempt.delivery_id,
+                    "started_at_ms": attempt.started_at_ms,
+                    "finished_at_ms": attempt.finished_at_ms,
+                    "outcome": attempt.outcome,
+                }
+                for attempt in status.history
+            ],
+        }
 
     def channel(self, *, concurrency: int = 1):
         from .channel import Channel

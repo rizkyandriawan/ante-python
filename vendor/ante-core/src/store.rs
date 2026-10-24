@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS entries (
     delivery_id INTEGER,
     lease_deadline_ms INTEGER,
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
     UNIQUE (queue_id, ready_seq),
     CHECK (
         (state = 'ready' AND delivery_id IS NULL AND lease_deadline_ms IS NULL)
@@ -48,6 +50,23 @@ CREATE TABLE IF NOT EXISTS entries (
         (state = 'inflight' AND delivery_id IS NOT NULL AND lease_deadline_ms IS NOT NULL)
     )
 );
+CREATE TABLE IF NOT EXISTS delivery_attempts (
+    delivery_id INTEGER PRIMARY KEY NOT NULL,
+    entry_id INTEGER NOT NULL,
+    queue_id INTEGER NOT NULL,
+    queue_name TEXT NOT NULL,
+    message_created_at_ms INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    started_at_ms INTEGER NOT NULL,
+    finished_at_ms INTEGER,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'inflight', 'acked', 'requeued', 'expired', 'recovered', 'discarded'
+    ))
+);
+CREATE INDEX IF NOT EXISTS attempts_entry
+    ON delivery_attempts(entry_id, attempt);
+CREATE INDEX IF NOT EXISTS attempts_queue
+    ON delivery_attempts(queue_id, started_at_ms);
 CREATE INDEX IF NOT EXISTS entries_ready
     ON entries(queue_id, ready_seq) WHERE state = 'ready';
 CREATE INDEX IF NOT EXISTS entries_inflight
@@ -56,6 +75,26 @@ CREATE INDEX IF NOT EXISTS entries_deadline
     ON entries(lease_deadline_ms) WHERE state = 'inflight';
 CREATE UNIQUE INDEX IF NOT EXISTS entries_delivery
     ON entries(delivery_id) WHERE delivery_id IS NOT NULL;
+"#;
+
+const ATTEMPTS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS delivery_attempts (
+    delivery_id INTEGER PRIMARY KEY NOT NULL,
+    entry_id INTEGER NOT NULL,
+    queue_id INTEGER NOT NULL,
+    queue_name TEXT NOT NULL,
+    message_created_at_ms INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    started_at_ms INTEGER NOT NULL,
+    finished_at_ms INTEGER,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'inflight', 'acked', 'requeued', 'expired', 'recovered', 'discarded'
+    ))
+);
+CREATE INDEX IF NOT EXISTS attempts_entry
+    ON delivery_attempts(entry_id, attempt);
+CREATE INDEX IF NOT EXISTS attempts_queue
+    ON delivery_attempts(queue_id, started_at_ms);
 "#;
 
 pub const DEFAULT_LEASE_MS: u64 = 30_000;
@@ -157,6 +196,66 @@ impl QueueInfo {
     pub fn total(&self) -> u64 {
         self.ready + self.inflight
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageState {
+    Ready,
+    Inflight,
+    Acked,
+    Requeued,
+    Expired,
+    Recovered,
+    Discarded,
+}
+
+impl MessageState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageState::Ready => "ready",
+            MessageState::Inflight => "inflight",
+            MessageState::Acked => "acked",
+            MessageState::Requeued => "requeued",
+            MessageState::Expired => "expired",
+            MessageState::Recovered => "recovered",
+            MessageState::Discarded => "discarded",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "ready" => Ok(MessageState::Ready),
+            "inflight" => Ok(MessageState::Inflight),
+            "acked" => Ok(MessageState::Acked),
+            "requeued" => Ok(MessageState::Requeued),
+            "expired" => Ok(MessageState::Expired),
+            "recovered" => Ok(MessageState::Recovered),
+            "discarded" => Ok(MessageState::Discarded),
+            other => Err(Error::Invalid(format!(
+                "unknown message state in storage: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptInfo {
+    pub attempt: u64,
+    pub delivery_id: u64,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub outcome: MessageState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageStatus {
+    pub queue: String,
+    pub message_id: u64,
+    pub state: MessageState,
+    pub attempts: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub history: Vec<AttemptInfo>,
 }
 
 pub struct Ante {
@@ -325,14 +424,16 @@ impl Ante {
         let mut next_message = next_meta(&tx, META_NEXT_MESSAGE)?;
         let mut next_seq = queue_next_seq(&tx, queue_id)?;
         let mut ids = Vec::with_capacity(messages.len());
+        let now = now_ms();
 
         {
             let mut insert = tx.prepare(
                 "INSERT INTO entries
                  (entry_id, queue_id, ready_seq, payload, content_type,
                   application_message_id, correlation_id, reply_to,
-                  state, delivery_id, lease_deadline_ms, attempts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', NULL, NULL, 0)",
+                  state, delivery_id, lease_deadline_ms, attempts,
+                  created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', NULL, NULL, 0, ?9, ?9)",
             )?;
             for message in messages {
                 let entry_id = next_message;
@@ -346,6 +447,7 @@ impl Ante {
                     message.message_id,
                     message.correlation_id,
                     message.reply_to,
+                    to_i64(now)?,
                 ])?;
                 next_seq += 1;
                 ids.push(entry_id);
@@ -416,7 +518,7 @@ impl Ante {
         let picked: Vec<PickedEntry> = {
             let mut statement = tx.prepare(
                 "SELECT entry_id, payload, content_type, application_message_id,
-                        correlation_id, reply_to, attempts, ready_seq
+                        correlation_id, reply_to, attempts, ready_seq, created_at_ms
                  FROM entries
                  WHERE queue_id = ?1 AND state = 'ready'
                  ORDER BY ready_seq
@@ -432,6 +534,7 @@ impl Ante {
                     reply_to: row.get(5)?,
                     attempts: row.get(6)?,
                     _ready_seq: row.get(7)?,
+                    created_at_ms: row.get(8)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -451,7 +554,8 @@ impl Ante {
             let mut update = tx.prepare(
                 "UPDATE entries
                  SET state = 'inflight', delivery_id = ?1,
-                     lease_deadline_ms = ?2, attempts = attempts + 1
+                     lease_deadline_ms = ?2, attempts = attempts + 1,
+                     updated_at_ms = ?4
                  WHERE entry_id = ?3 AND state = 'ready'",
             )?;
             for entry in picked {
@@ -462,12 +566,28 @@ impl Ante {
                     to_i64(delivery_id)?,
                     to_i64(deadline_ms)?,
                     entry.entry_id,
+                    to_i64(now)?,
                 ])?;
                 if changed != 1 {
                     return Err(Error::Invalid(
                         "ready entry changed during claim".to_string(),
                     ));
                 }
+                tx.execute(
+                    "INSERT INTO delivery_attempts
+                     (delivery_id, entry_id, queue_id, queue_name,
+                      message_created_at_ms, attempt, started_at_ms, finished_at_ms, outcome)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'inflight')",
+                    params![
+                        to_i64(delivery_id)?,
+                        entry.entry_id,
+                        queue_id,
+                        queue,
+                        entry.created_at_ms,
+                        entry.attempts + 1,
+                        to_i64(now)?,
+                    ],
+                )?;
                 deliveries.push(Delivery {
                     token: DeliveryToken {
                         message_id: from_i64(entry.entry_id)?,
@@ -497,11 +617,30 @@ impl Ante {
     }
 
     pub fn ack_batch(&self, tokens: &[DeliveryToken]) -> Result<Vec<AckOutcome>> {
+        self.settle_batch(tokens, MessageState::Acked)
+    }
+
+    /// Permanently remove a delivery without treating it as successful.
+    pub fn discard_batch(&self, tokens: &[DeliveryToken]) -> Result<Vec<AckOutcome>> {
+        self.settle_batch(tokens, MessageState::Discarded)
+    }
+
+    pub fn discard(&self, token: &DeliveryToken) -> Result<AckOutcome> {
+        let mut outcomes = self.discard_batch(std::slice::from_ref(token))?;
+        Ok(outcomes.remove(0))
+    }
+
+    fn settle_batch(
+        &self,
+        tokens: &[DeliveryToken],
+        outcome: MessageState,
+    ) -> Result<Vec<AckOutcome>> {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
         let mut writer = self.writer()?;
         let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
         let mut outcomes = Vec::with_capacity(tokens.len());
         for token in tokens {
             let current: Option<i64> = tx
@@ -519,6 +658,18 @@ impl Ante {
                 }
                 Some(_) => {
                     tx.execute(
+                        "UPDATE delivery_attempts
+                         SET finished_at_ms = ?1, outcome = ?2
+                         WHERE entry_id = ?3 AND delivery_id = ?4
+                           AND finished_at_ms IS NULL",
+                        params![
+                            to_i64(now)?,
+                            outcome.as_str(),
+                            to_i64(token.message_id)?,
+                            to_i64(token.delivery_id)?
+                        ],
+                    )?;
+                    tx.execute(
                         "DELETE FROM entries
                          WHERE entry_id = ?1 AND state = 'inflight' AND delivery_id = ?2",
                         params![to_i64(token.message_id)?, to_i64(token.delivery_id)?],
@@ -534,6 +685,7 @@ impl Ante {
     pub fn requeue(&self, token: &DeliveryToken) -> Result<RequeueOutcome> {
         let mut writer = self.writer()?;
         let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
         let current: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT queue_id, delivery_id FROM entries
@@ -548,7 +700,7 @@ impl Ante {
                 RequeueOutcome::Stale
             }
             Some((queue_id, _)) => {
-                requeue_entry(&tx, token.message_id, queue_id)?;
+                requeue_entry(&tx, token.message_id, queue_id, MessageState::Requeued, now)?;
                 RequeueOutcome::Requeued
             }
         };
@@ -602,6 +754,12 @@ impl Ante {
         if require_empty && total != 0 {
             return Ok(None);
         }
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET finished_at_ms = ?1, outcome = 'discarded'
+             WHERE queue_id = ?2 AND finished_at_ms IS NULL",
+            params![to_i64(now_ms())?, to_i64(queue_id)?],
+        )?;
         tx.execute("DELETE FROM queues WHERE id = ?1", [to_i64(queue_id)?])?;
         tx.commit()?;
         Ok(Some(total as u64))
@@ -683,6 +841,117 @@ impl Ante {
             Ok(out)
         })
     }
+
+    /// Current state and attempt history for one message.
+    ///
+    /// Finished history is retained after ack and after queue deletion. `None`
+    /// means the message id is unknown, or its history belongs to another queue.
+    pub fn message_status(&self, queue: &str, message_id: u64) -> Result<Option<MessageStatus>> {
+        self.with_reader(|reader| {
+            let active: Option<(String, String, i64, i64, i64)> = reader
+                .query_row(
+                    "SELECT q.name, e.state, e.attempts, e.created_at_ms, e.updated_at_ms
+                     FROM entries e JOIN queues q ON q.id = e.queue_id
+                     WHERE e.entry_id = ?1 AND q.name = ?2",
+                    params![to_i64(message_id)?, queue],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((queue, state, attempts, created_at_ms, updated_at_ms)) = active {
+                return Ok(Some(MessageStatus {
+                    queue,
+                    message_id,
+                    state: MessageState::parse(&state)?,
+                    attempts: from_i64(attempts)?,
+                    created_at_ms: from_i64(created_at_ms)?,
+                    updated_at_ms: from_i64(updated_at_ms)?,
+                    history: attempt_history(reader, message_id)?,
+                }));
+            }
+
+            let finished: Vec<(String, i64, i64, i64, Option<i64>, String)> = {
+                let mut statement = reader.prepare(
+                    "SELECT queue_name, message_created_at_ms, attempt,
+                            started_at_ms, finished_at_ms, outcome
+                     FROM delivery_attempts
+                     WHERE entry_id = ?1
+                     ORDER BY attempt",
+                )?;
+                let rows = statement.query_map([to_i64(message_id)?], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                out
+            };
+            let Some((stored_queue, created_at_ms, _, _, _, _)) = finished.first() else {
+                return Ok(None);
+            };
+            if stored_queue != queue {
+                return Ok(None);
+            }
+            let Some((_, _, last_attempt, last_started, last_finished, outcome)) = finished.last()
+            else {
+                return Ok(None);
+            };
+            Ok(Some(MessageStatus {
+                queue: stored_queue.clone(),
+                message_id,
+                state: MessageState::parse(outcome)?,
+                attempts: from_i64(*last_attempt)?,
+                created_at_ms: from_i64(*created_at_ms)?,
+                updated_at_ms: from_i64(last_finished.unwrap_or(*last_started))?,
+                history: attempt_history(reader, message_id)?,
+            }))
+        })
+    }
+}
+
+fn attempt_history(reader: &Connection, entry_id: u64) -> Result<Vec<AttemptInfo>> {
+    let mut statement = reader.prepare(
+        "SELECT attempt, delivery_id, started_at_ms, finished_at_ms, outcome
+         FROM delivery_attempts
+         WHERE entry_id = ?1
+         ORDER BY attempt",
+    )?;
+    let rows = statement.query_map([to_i64(entry_id)?], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut history = Vec::new();
+    for row in rows {
+        let (attempt, delivery_id, started_at_ms, finished_at_ms, outcome) = row?;
+        history.push(AttemptInfo {
+            attempt: from_i64(attempt)?,
+            delivery_id: from_i64(delivery_id)?,
+            started_at_ms: from_i64(started_at_ms)?,
+            finished_at_ms: finished_at_ms.map(from_i64).transpose()?,
+            outcome: MessageState::parse(&outcome)?,
+        });
+    }
+    Ok(history)
 }
 
 struct PickedEntry {
@@ -694,6 +963,7 @@ struct PickedEntry {
     reply_to: Option<String>,
     attempts: i64,
     _ready_seq: i64,
+    created_at_ms: i64,
 }
 
 fn acquire_lock(path: &Path) -> Result<File> {
@@ -795,10 +1065,10 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<()> {
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, 1)",
             [META_NEXT_DELIVERY],
         )?;
-        tx.commit()?;
-        connection.execute_batch(&format!(
+        tx.execute_batch(&format!(
             "PRAGMA application_id = {APPLICATION_ID}; PRAGMA user_version = {SCHEMA_VERSION};"
         ))?;
+        tx.commit()?;
         return Ok(());
     }
 
@@ -807,11 +1077,6 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<()> {
             "SQLite database was not created by Ante".into(),
         ));
     }
-    if version != SCHEMA_VERSION as i64 {
-        return Err(Error::UnsupportedFormat(format!(
-            "unsupported database schema version {version}"
-        )));
-    }
     let stored: Option<i64> = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = ?1",
@@ -819,11 +1084,52 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<()> {
             |row| row.get(0),
         )
         .optional()?;
+    if version == 1 && stored == Some(1) {
+        migrate_v1(connection)?;
+        return Ok(());
+    }
+    if version != SCHEMA_VERSION as i64 {
+        return Err(Error::UnsupportedFormat(format!(
+            "unsupported database schema version {version}"
+        )));
+    }
     if stored != Some(SCHEMA_VERSION as i64) {
         return Err(Error::UnsupportedFormat(
             "database metadata schema does not match user_version".into(),
         ));
     }
+    Ok(())
+}
+
+fn migrate_v1(connection: &mut Connection) -> Result<()> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "ALTER TABLE entries ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE entries ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    tx.execute_batch(ATTEMPTS_SCHEMA)?;
+    let now = now_ms();
+    tx.execute(
+        "UPDATE entries SET created_at_ms = ?1, updated_at_ms = ?1
+         WHERE created_at_ms = 0",
+        [to_i64(now)?],
+    )?;
+    tx.execute(
+        "INSERT INTO delivery_attempts
+         (delivery_id, entry_id, queue_id, queue_name, message_created_at_ms,
+          attempt, started_at_ms, finished_at_ms, outcome)
+         SELECT e.delivery_id, e.entry_id, e.queue_id, q.name, e.created_at_ms,
+                e.attempts, ?1, NULL, 'inflight'
+         FROM entries e JOIN queues q ON q.id = e.queue_id
+         WHERE e.state = 'inflight'",
+        [to_i64(now)?],
+    )?;
+    tx.execute(
+        "UPDATE metadata SET value = ?1 WHERE key = ?2",
+        params![to_i64(SCHEMA_VERSION)?, META_SCHEMA],
+    )?;
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -879,13 +1185,26 @@ fn set_queue_next_seq(tx: &Transaction<'_>, queue_id: i64, value: u64) -> Result
     Ok(())
 }
 
-fn requeue_entry(tx: &Transaction<'_>, entry_id: u64, queue_id: i64) -> Result<()> {
+fn requeue_entry(
+    tx: &Transaction<'_>,
+    entry_id: u64,
+    queue_id: i64,
+    outcome: MessageState,
+    now: u64,
+) -> Result<()> {
     let next = queue_next_seq(tx, queue_id)?;
     tx.execute(
+        "UPDATE delivery_attempts
+         SET finished_at_ms = ?1, outcome = ?2
+         WHERE entry_id = ?3 AND finished_at_ms IS NULL",
+        params![to_i64(now)?, outcome.as_str(), to_i64(entry_id)?],
+    )?;
+    tx.execute(
         "UPDATE entries
-         SET state = 'ready', ready_seq = ?1, delivery_id = NULL, lease_deadline_ms = NULL
+         SET state = 'ready', ready_seq = ?1, delivery_id = NULL,
+             lease_deadline_ms = NULL, updated_at_ms = ?3
          WHERE entry_id = ?2 AND state = 'inflight'",
-        params![to_i64(next)?, to_i64(entry_id)?],
+        params![to_i64(next)?, to_i64(entry_id)?, to_i64(now)?],
     )?;
     set_queue_next_seq(
         tx,
@@ -912,12 +1231,19 @@ fn requeue_expired_tx(tx: &Transaction<'_>, now: u64) -> Result<u64> {
         out
     };
     for (entry_id, queue_id) in &targets {
-        requeue_entry(tx, from_i64(*entry_id)?, *queue_id)?;
+        requeue_entry(
+            tx,
+            from_i64(*entry_id)?,
+            *queue_id,
+            MessageState::Expired,
+            now,
+        )?;
     }
     Ok(targets.len() as u64)
 }
 
 fn requeue_all_inflight(tx: &Transaction<'_>) -> Result<u64> {
+    let now = now_ms();
     let targets: Vec<(i64, i64)> = {
         let mut statement = tx.prepare(
             "SELECT entry_id, queue_id FROM entries
@@ -933,7 +1259,13 @@ fn requeue_all_inflight(tx: &Transaction<'_>) -> Result<u64> {
         out
     };
     for (entry_id, queue_id) in &targets {
-        requeue_entry(tx, from_i64(*entry_id)?, *queue_id)?;
+        requeue_entry(
+            tx,
+            from_i64(*entry_id)?,
+            *queue_id,
+            MessageState::Recovered,
+            now,
+        )?;
     }
     Ok(targets.len() as u64)
 }

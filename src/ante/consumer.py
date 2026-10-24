@@ -212,7 +212,7 @@ class Consumer:
             if action == "requeue":
                 delivery.requeue()
             else:
-                delivery.ack()
+                delivery.discard()
         except AnteError as settle_error:
             log.warning(
                 "ante: could not settle delivery %s on %s: %s",

@@ -3077,7 +3077,7 @@ async fn handle_reject(
             if requeue {
                 ante.requeue(&token)?;
             } else {
-                ante.ack(&token)?;
+                ante.discard(&token)?;
             }
         }
         Ok(())

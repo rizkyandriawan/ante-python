@@ -39,6 +39,26 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(info["ready"], 0)
         self.assertEqual(info["inflight"], 0)
 
+    def test_message_status_and_history(self):
+        message_id = self.ante.publish("jobs", {"n": 1})
+        status = self.ante.message_status("jobs", message_id)
+        self.assertEqual(status["state"], "ready")
+        self.assertEqual(status["attempts"], 0)
+        self.assertEqual(status["history"], [])
+
+        [delivery] = self.ante.take("jobs", max=1, wait_ms=1000)
+        status = self.ante.message_status("jobs", message_id)
+        self.assertEqual(status["state"], "inflight")
+        self.assertEqual(status["history"][0]["outcome"], "inflight")
+        self.assertIsNone(status["history"][0]["finished_at_ms"])
+
+        delivery.ack()
+        status = self.ante.message_status("jobs", message_id)
+        self.assertEqual(status["state"], "acked")
+        self.assertEqual(status["history"][0]["outcome"], "acked")
+        self.assertIsNotNone(status["history"][0]["finished_at_ms"])
+        self.assertIsNone(self.ante.message_status("jobs", message_id + 1))
+
     def test_publish_batch(self):
         ids = self.ante.publish_batch("jobs", [{"n": 1}, {"n": 2}, {"n": 3}])
         self.assertEqual(len(ids), 3)
@@ -123,11 +143,13 @@ class SmokeTests(unittest.TestCase):
             prefetch=1,
             on_error=lambda _error, _delivery: "drop",
         )
-        self.ante.publish("jobs", {"n": 1})
+        message_id = self.ante.publish("jobs", {"n": 1})
         self.assertTrue(
             wait_for(lambda: self.ante.info("jobs")["total"] == 0),
             "poison message was not dropped",
         )
+        status = self.ante.message_status("jobs", message_id)
+        self.assertEqual(status["state"], "discarded")
         consumer.stop()
 
 

@@ -94,6 +94,54 @@ impl Record {
     }
 }
 
+#[derive(Clone)]
+#[pyclass(get_all)]
+struct Attempt {
+    attempt: u64,
+    delivery_id: u64,
+    started_at_ms: u64,
+    finished_at_ms: Option<u64>,
+    outcome: String,
+}
+
+impl From<ante_core::AttemptInfo> for Attempt {
+    fn from(attempt: ante_core::AttemptInfo) -> Self {
+        Self {
+            attempt: attempt.attempt,
+            delivery_id: attempt.delivery_id,
+            started_at_ms: attempt.started_at_ms,
+            finished_at_ms: attempt.finished_at_ms,
+            outcome: attempt.outcome.as_str().to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(get_all)]
+struct Status {
+    queue: String,
+    message_id: u64,
+    state: String,
+    attempts: u64,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    history: Vec<Attempt>,
+}
+
+impl From<ante_core::MessageStatus> for Status {
+    fn from(status: ante_core::MessageStatus) -> Self {
+        Self {
+            queue: status.queue,
+            message_id: status.message_id,
+            state: status.state.as_str().to_owned(),
+            attempts: status.attempts,
+            created_at_ms: status.created_at_ms,
+            updated_at_ms: status.updated_at_ms,
+            history: status.history.into_iter().map(Attempt::from).collect(),
+        }
+    }
+}
+
 #[pyclass(get_all)]
 struct Info {
     name: String,
@@ -335,6 +383,17 @@ impl Engine {
         })
     }
 
+    fn discard(&self, py: Python<'_>, token: String) -> PyResult<String> {
+        self.run(py, |engine| {
+            Ok(match engine.discard(&DeliveryToken::parse(&token)?)? {
+                AckOutcome::Acked => "OK",
+                AckOutcome::Stale => "STALE_DELIVERY",
+                AckOutcome::Unknown => "UNKNOWN_DELIVERY",
+            }
+            .to_owned())
+        })
+    }
+
     fn requeue(&self, py: Python<'_>, token: String) -> PyResult<String> {
         self.run(py, |engine| {
             Ok(match engine.requeue(&DeliveryToken::parse(&token)?)? {
@@ -348,6 +407,17 @@ impl Engine {
 
     fn info(&self, py: Python<'_>, queue: String) -> PyResult<Info> {
         self.run(py, |engine| engine.info(&queue).map(Info::from))
+    }
+
+    fn message_status(
+        &self,
+        py: Python<'_>,
+        queue: String,
+        message_id: u64,
+    ) -> PyResult<Option<Status>> {
+        self.run(py, |engine| {
+            Ok(engine.message_status(&queue, message_id)?.map(Status::from))
+        })
     }
 
     fn list_queues(&self, py: Python<'_>) -> PyResult<Vec<Info>> {

@@ -164,6 +164,11 @@ Additional storage operations:
   message ID, and lease deadline.
 - `ack(*tokens)` → per-token `AckResult`; `requeue(token)`.
 - `info(queue)`, `list_queues()`, `queue_exists(queue)`.
+- `message_status(queue, message_id)` returns `state`, timestamps, and retained
+  attempt history, or `None` for an unknown message. History survives ack and
+  queue deletion.
+- `delivery.discard()` permanently drops a message and records `discarded`
+  instead of `acked`; the high-level `on_error` drop policy uses it.
 - `purge(queue)`, `delete_queue(queue)`, `recover_expired()`.
 
 `publish` encodes dict/list values as JSON, strings as UTF-8, and bytes-like
