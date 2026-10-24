@@ -25,7 +25,7 @@ impl TempDb {
         TempDb { dir }
     }
     fn path(&self) -> PathBuf {
-        self.dir.join("ante.redb")
+        self.dir.join("ante.sqlite3")
     }
 }
 

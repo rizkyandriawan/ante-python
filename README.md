@@ -1,7 +1,7 @@
 # Ante for Python
 
 A durable work queue embedded **inside your Python process**, backed by Rust,
-redb, and PyO3. No daemon, socket, URL, or executable to manage.
+SQLite, and PyO3. No daemon, socket, URL, or executable to manage.
 
 The consumer API follows Pika's `BlockingChannel` naming and callback shape.
 `concurrency` adds a bounded worker pool for parallel jobs in one process.
@@ -46,8 +46,8 @@ with Ante.open() as connection:
         channel.stop_consuming()
 ```
 
-`Ante.open()` stores data in `.ante/ante.redb` under the working directory.
-`ANTE_DB` or `Ante.open("./data/queue.redb")` optionally overrides it. Open once
+`Ante.open()` stores data in `.ante/ante.sqlite3` under the working directory.
+`ANTE_DB` or `Ante.open("./data/queue.sqlite3")` optionally overrides it. Open once
 at app startup and share that instance across threads. Close at app shutdown.
 One process owns a database file; several Python processes cannot open it
 simultaneously.
@@ -75,7 +75,7 @@ simultaneously.
 
 Threads overlap network/disk I/O. Pure Python CPU work remains limited by the
 GIL on standard CPython. Rust storage operations release the GIL while running;
-redb transactions are synchronized inside the engine. Parallel callbacks can
+SQLite transactions are serialized inside the engine. Parallel callbacks can
 complete out of order. Delivery is **at-least-once**: jobs must tolerate retries.
 A lease defaults to 30 seconds; configure `lease_ms` in the high-level consumer
 for longer jobs. Lease renewal is not provided.

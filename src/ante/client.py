@@ -321,5 +321,5 @@ def _database_path(db: str | os.PathLike[str] | None) -> Path:
     return (
         Path(configured).expanduser()
         if configured
-        else Path.cwd() / ".ante" / "ante.redb"
+        else Path.cwd() / ".ante" / "ante.sqlite3"
     )

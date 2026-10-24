@@ -6,4 +6,5 @@ license = "MIT"
 description = "Durable work-queue engine for Ante"
 
 [dependencies]
-redb = "2.6"
+fs2 = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }

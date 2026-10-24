@@ -37,7 +37,7 @@ impl Drop for TempDir {
 
 fn open() -> (TempDir, Arc<Ante>) {
     let dir = TempDir::new("ante-concurrency");
-    let ante = Arc::new(Ante::open(dir.path.join("ante.redb")).unwrap());
+    let ante = Arc::new(Ante::open(dir.path.join("ante.sqlite3")).unwrap());
     (dir, ante)
 }
 

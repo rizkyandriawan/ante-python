@@ -19,7 +19,7 @@ def wait_for(predicate, timeout=5.0):
 class SmokeTests(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory(prefix="ante-py-")
-        self.ante = Ante.open(Path(self._dir.name) / "ante.redb")
+        self.ante = Ante.open(Path(self._dir.name) / "ante.sqlite3")
         self.ante.declare("jobs")
 
     def tearDown(self):

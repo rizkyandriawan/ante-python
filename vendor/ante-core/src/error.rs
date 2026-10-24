@@ -10,6 +10,8 @@ pub enum Error {
     BatchTooLarge { messages: usize, max: usize },
     BatchTooManyBytes { bytes: usize, max: usize },
     Invalid(String),
+    EngineOpen(String),
+    UnsupportedFormat(String),
     Poisoned,
     Storage(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -23,6 +25,8 @@ impl Error {
             Error::BatchTooLarge { .. } => "BATCH_TOO_LARGE",
             Error::BatchTooManyBytes { .. } => "BATCH_TOO_LARGE",
             Error::Invalid(_) => "INVALID",
+            Error::EngineOpen(_) => "ENGINE_OPEN",
+            Error::UnsupportedFormat(_) => "UNSUPPORTED_FORMAT",
             Error::Poisoned => "INTERNAL",
             Error::Storage(_) => "STORAGE",
         }
@@ -44,6 +48,8 @@ impl fmt::Display for Error {
                 write!(f, "batch is {bytes} bytes, limit is {max}")
             }
             Error::Invalid(msg) => write!(f, "invalid request: {msg}"),
+            Error::EngineOpen(path) => write!(f, "database is already open: {path}"),
+            Error::UnsupportedFormat(msg) => write!(f, "unsupported database: {msg}"),
             Error::Poisoned => write!(f, "storage lock poisoned"),
             Error::Storage(err) => write!(f, "storage error: {err}"),
         }
@@ -71,13 +77,7 @@ macro_rules! from_storage {
     };
 }
 
-from_storage!(
-    redb::DatabaseError,
-    redb::TransactionError,
-    redb::TableError,
-    redb::StorageError,
-    redb::CommitError,
-);
+from_storage!(rusqlite::Error);
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {

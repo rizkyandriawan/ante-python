@@ -1,10 +1,9 @@
-//! Ante core: named, durable work queues on redb.
+//! Ante core: named, durable work queues on SQLite.
 //!
 //! Delivery contract: at-least-once. A message is removed only after it has
 //! been acknowledged. In-flight messages whose lease expired, or whose owner
 //! vanished, are returned to the ready queue.
 
-mod codec;
 mod error;
 mod store;
 

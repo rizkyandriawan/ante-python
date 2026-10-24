@@ -1,25 +1,62 @@
 use std::fmt;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use fs2::FileExt;
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
-use crate::codec::{DeliveryRecord, MessageRecord};
 use crate::{Error, Result, SCHEMA_VERSION};
-
-const QUEUES: TableDefinition<&str, u64> = TableDefinition::new("queues");
-const SEQ: TableDefinition<u64, u64> = TableDefinition::new("seq");
-const MESSAGES: TableDefinition<u64, &[u8]> = TableDefinition::new("messages");
-const READY: TableDefinition<(u64, u64), u64> = TableDefinition::new("ready");
-const INFLIGHT: TableDefinition<u64, &[u8]> = TableDefinition::new("inflight");
-const ATTEMPTS: TableDefinition<u64, u64> = TableDefinition::new("attempts");
-const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 const META_NEXT_QUEUE: &str = "next_queue";
 const META_NEXT_MESSAGE: &str = "next_message";
 const META_NEXT_DELIVERY: &str = "next_delivery";
 const META_SCHEMA: &str = "schema_version";
+const APPLICATION_ID: i64 = 0x414E_5445;
+const READER_CONNECTIONS: usize = 2;
+const BUSY_TIMEOUT_MS: u64 = 1_000;
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY NOT NULL,
+    value INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS queues (
+    id INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL UNIQUE,
+    next_ready_seq INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS entries (
+    entry_id INTEGER PRIMARY KEY NOT NULL,
+    queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
+    ready_seq INTEGER NOT NULL,
+    payload BLOB NOT NULL,
+    content_type TEXT,
+    application_message_id TEXT,
+    correlation_id TEXT,
+    reply_to TEXT,
+    state TEXT NOT NULL CHECK (state IN ('ready', 'inflight')),
+    delivery_id INTEGER,
+    lease_deadline_ms INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    UNIQUE (queue_id, ready_seq),
+    CHECK (
+        (state = 'ready' AND delivery_id IS NULL AND lease_deadline_ms IS NULL)
+        OR
+        (state = 'inflight' AND delivery_id IS NOT NULL AND lease_deadline_ms IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS entries_ready
+    ON entries(queue_id, ready_seq) WHERE state = 'ready';
+CREATE INDEX IF NOT EXISTS entries_inflight
+    ON entries(queue_id) WHERE state = 'inflight';
+CREATE INDEX IF NOT EXISTS entries_deadline
+    ON entries(lease_deadline_ms) WHERE state = 'inflight';
+CREATE UNIQUE INDEX IF NOT EXISTS entries_delivery
+    ON entries(delivery_id) WHERE delivery_id IS NOT NULL;
+"#;
 
 pub const DEFAULT_LEASE_MS: u64 = 30_000;
 
@@ -123,13 +160,17 @@ impl QueueInfo {
 }
 
 pub struct Ante {
-    db: Mutex<Database>,
+    writer: Mutex<Connection>,
+    readers: Mutex<Vec<Connection>>,
+    path: PathBuf,
     options: Options,
+    _lock: File,
 }
 
 impl fmt::Debug for Ante {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ante")
+            .field("path", &self.path)
             .field("options", &self.options)
             .finish()
     }
@@ -141,28 +182,30 @@ impl Ante {
     }
 
     pub fn open_with(path: impl AsRef<Path>, options: Options) -> Result<Self> {
-        let db = redb::Builder::new()
-            .set_cache_size(options.cache_size)
-            .create(path.as_ref())?;
-        {
-            let write = db.begin_write()?;
-            {
-                let _ = write.open_table(QUEUES)?;
-                let _ = write.open_table(SEQ)?;
-                let _ = write.open_table(MESSAGES)?;
-                let _ = write.open_table(READY)?;
-                let _ = write.open_table(INFLIGHT)?;
-                let _ = write.open_table(ATTEMPTS)?;
-                let _ = write.open_table(META)?;
-            }
-            write.commit()?;
-        }
+        let path = path.as_ref().to_path_buf();
+        let lock = acquire_lock(&path)?;
+        reject_foreign_file(&path)?;
+
+        let mut writer = Connection::open(&path)?;
+        configure(&writer, writer_cache_kib(&options), true)?;
+        initialize_or_validate(&mut writer)?;
         let ante = Ante {
-            db: Mutex::new(db),
+            writer: Mutex::new(writer),
+            readers: Mutex::new(Vec::new()),
+            path,
             options,
+            _lock: lock,
         };
-        ante.check_schema()?;
         ante.recover_startup()?;
+
+        let mut readers = Vec::with_capacity(READER_CONNECTIONS);
+        for _ in 0..READER_CONNECTIONS {
+            let reader = Connection::open(&ante.path)?;
+            configure(&reader, reader_cache_kib(&ante.options), false)?;
+            reader.execute_batch("PRAGMA query_only = ON;")?;
+            readers.push(reader);
+        }
+        *ante.readers.lock().map_err(|_| Error::Poisoned)? = readers;
         Ok(ante)
     }
 
@@ -170,86 +213,56 @@ impl Ante {
         &self.options
     }
 
-    fn db(&self) -> Result<std::sync::MutexGuard<'_, Database>> {
-        self.db.lock().map_err(|_| Error::Poisoned)
+    fn writer(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.writer.lock().map_err(|_| Error::Poisoned)
     }
 
-    fn check_schema(&self) -> Result<()> {
-        let db = self.db()?;
-        let write = db.begin_write()?;
-        let current = {
-            let meta = write.open_table(META)?;
-            let value = meta.get(META_SCHEMA)?.map(|entry| entry.value());
-            value
-        };
-        match current {
-            Some(version) if version == SCHEMA_VERSION => {}
-            Some(version) => {
-                return Err(Error::Invalid(format!(
-                    "unsupported schema version {version}"
-                )))
-            }
+    fn with_reader<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let mut readers = self.readers.lock().map_err(|_| Error::Poisoned)?;
+        let reader = match readers.pop() {
+            Some(reader) => reader,
             None => {
-                let mut meta = write.open_table(META)?;
-                meta.insert(META_SCHEMA, SCHEMA_VERSION)?;
-                meta.insert(META_NEXT_QUEUE, 1)?;
-                meta.insert(META_NEXT_MESSAGE, 1)?;
-                meta.insert(META_NEXT_DELIVERY, 1)?;
+                let reader = Connection::open(&self.path)?;
+                configure(&reader, reader_cache_kib(&self.options), false)?;
+                reader.execute_batch("PRAGMA query_only = ON;")?;
+                reader
             }
-        }
-        write.commit()?;
-        Ok(())
+        };
+        let result = f(&reader);
+        readers.push(reader);
+        result
     }
 
     /// Requeue every in-flight message left behind by a previous process.
     fn recover_startup(&self) -> Result<u64> {
-        let db = self.db()?;
-        let write = db.begin_write()?;
-        let recovered = requeue_inflight(&write, |_| true)?;
-        if recovered == 0 {
-            write.abort()?;
-        } else {
-            write.commit()?;
-        }
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recovered = requeue_all_inflight(&tx)?;
+        tx.commit()?;
         Ok(recovered)
     }
 
     pub fn declare_queue(&self, name: &str) -> Result<u64> {
         validate_name(name)?;
-        let db = self.db()?;
-        let write = db.begin_write()?;
-        let existing = {
-            let queues = write.open_table(QUEUES)?;
-            let value = queues.get(name)?.map(|entry| entry.value());
-            value
-        };
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<i64> = tx
+            .query_row("SELECT id FROM queues WHERE name = ?1", [name], |row| {
+                row.get(0)
+            })
+            .optional()?;
         let id = match existing {
-            Some(id) => id,
+            Some(id) => from_i64(id)?,
             None => {
-                let id = {
-                    let meta = write.open_table(META)?;
-                    let value = meta
-                        .get(META_NEXT_QUEUE)?
-                        .map(|entry| entry.value())
-                        .unwrap_or(1);
-                    value
-                };
-                {
-                    let mut meta = write.open_table(META)?;
-                    meta.insert(META_NEXT_QUEUE, id + 1)?;
-                }
-                {
-                    let mut queues = write.open_table(QUEUES)?;
-                    queues.insert(name, id)?;
-                }
-                {
-                    let mut seq = write.open_table(SEQ)?;
-                    seq.insert(id, 1)?;
-                }
+                let id = next_meta(&tx, META_NEXT_QUEUE)?;
+                tx.execute(
+                    "INSERT INTO queues (id, name, next_ready_seq) VALUES (?1, ?2, 1)",
+                    params![to_i64(id)?, name],
+                )?;
                 id
             }
         };
-        write.commit()?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -260,10 +273,14 @@ impl Ante {
     /// Stable identity of a queue. A delete-and-recreate produces a new id, so
     /// long-lived consumers can detect that their queue was replaced.
     pub fn queue_id(&self, name: &str) -> Result<Option<u64>> {
-        let db = self.db()?;
-        let read = db.begin_read()?;
-        let queues = read.open_table(QUEUES)?;
-        Ok(queues.get(name)?.map(|entry| entry.value()))
+        self.with_reader(|reader| {
+            let id: Option<i64> = reader
+                .query_row("SELECT id FROM queues WHERE name = ?1", [name], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            id.map(from_i64).transpose()
+        })
     }
 
     pub fn publish(&self, queue: &str, message: NewMessage) -> Result<u64> {
@@ -297,47 +314,47 @@ impl Ante {
             }
         }
 
-        let db = self.db()?;
-        let write = db.begin_write()?;
-        let ids;
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let queue_id: i64 = tx
+            .query_row("SELECT id FROM queues WHERE name = ?1", [queue], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
+        let mut next_message = next_meta(&tx, META_NEXT_MESSAGE)?;
+        let mut next_seq = queue_next_seq(&tx, queue_id)?;
+        let mut ids = Vec::with_capacity(messages.len());
+
         {
-            let found = {
-                let queues = write.open_table(QUEUES)?;
-                let value = queues.get(queue)?.map(|entry| entry.value());
-                value
-            };
-            let queue_id = found.ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
-            let mut messages_table = write.open_table(MESSAGES)?;
-            let mut ready = write.open_table(READY)?;
-            let mut seq = write.open_table(SEQ)?;
-            let mut meta = write.open_table(META)?;
-
-            let mut next_message = meta.get(META_NEXT_MESSAGE)?.map(|v| v.value()).unwrap_or(1);
-            let mut next_seq = seq.get(queue_id)?.map(|v| v.value()).unwrap_or(1);
-            let mut out = Vec::with_capacity(messages.len());
-
+            let mut insert = tx.prepare(
+                "INSERT INTO entries
+                 (entry_id, queue_id, ready_seq, payload, content_type,
+                  application_message_id, correlation_id, reply_to,
+                  state, delivery_id, lease_deadline_ms, attempts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', NULL, NULL, 0)",
+            )?;
             for message in messages {
-                let record = MessageRecord {
-                    payload: message.payload,
-                    content_type: message.content_type,
-                    message_id: message.message_id,
-                    correlation_id: message.correlation_id,
-                    reply_to: message.reply_to,
-                };
-                let encoded = record.encode();
-                let message_id = next_message;
+                let entry_id = next_message;
                 next_message += 1;
-                messages_table.insert(message_id, encoded.as_slice())?;
-                ready.insert((queue_id, next_seq), message_id)?;
+                insert.execute(params![
+                    to_i64(entry_id)?,
+                    queue_id,
+                    to_i64(next_seq)?,
+                    message.payload,
+                    message.content_type,
+                    message.message_id,
+                    message.correlation_id,
+                    message.reply_to,
+                ])?;
                 next_seq += 1;
-                out.push(message_id);
+                ids.push(entry_id);
             }
-
-            seq.insert(queue_id, next_seq)?;
-            meta.insert(META_NEXT_MESSAGE, next_message)?;
-            ids = out;
         }
-        write.commit()?;
+
+        set_meta(&tx, META_NEXT_MESSAGE, next_message)?;
+        set_queue_next_seq(&tx, queue_id, next_seq)?;
+        tx.commit()?;
         Ok(ids)
     }
 
@@ -377,16 +394,16 @@ impl Ante {
             lease_ms
         };
         let now = now_ms();
-        let db = self.db()?;
-        let write = db.begin_write()?;
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let found = {
-            let queues = write.open_table(QUEUES)?;
-            let value = queues.get(queue)?.map(|entry| entry.value());
-            value
-        };
+        let found: Option<i64> = tx
+            .query_row("SELECT id FROM queues WHERE name = ?1", [queue], |row| {
+                row.get(0)
+            })
+            .optional()?;
         let queue_id = match found {
-            Some(id) => id,
+            Some(id) => from_i64(id)?,
             None if expected.is_some() => return Ok(None),
             None => return Err(Error::QueueNotFound(queue.to_string())),
         };
@@ -394,81 +411,83 @@ impl Ante {
             return Ok(None);
         }
 
-        requeue_inflight(&write, |record| record.deadline_ms <= now)?;
+        requeue_expired_tx(&tx, now)?;
 
-        let picked: Vec<(u64, u64)> = {
-            let ready = write.open_table(READY)?;
-            let range = ready.range((queue_id, 0u64)..=(queue_id, u64::MAX))?;
-            let mut out = Vec::with_capacity(max);
-            for item in range.take(max) {
-                let (key, value) = item?;
-                out.push((key.value().1, value.value()));
+        let picked: Vec<PickedEntry> = {
+            let mut statement = tx.prepare(
+                "SELECT entry_id, payload, content_type, application_message_id,
+                        correlation_id, reply_to, attempts, ready_seq
+                 FROM entries
+                 WHERE queue_id = ?1 AND state = 'ready'
+                 ORDER BY ready_seq
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![to_i64(queue_id)?, max as i64], |row| {
+                Ok(PickedEntry {
+                    entry_id: row.get(0)?,
+                    payload: row.get(1)?,
+                    content_type: row.get(2)?,
+                    application_message_id: row.get(3)?,
+                    correlation_id: row.get(4)?,
+                    reply_to: row.get(5)?,
+                    attempts: row.get(6)?,
+                    _ready_seq: row.get(7)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
             }
             out
         };
 
         if picked.is_empty() {
-            write.abort()?;
             return Ok(Some(Vec::new()));
         }
 
+        let mut next_delivery = next_meta(&tx, META_NEXT_DELIVERY)?;
         let mut deliveries = Vec::with_capacity(picked.len());
         {
-            let mut ready = write.open_table(READY)?;
-            let mut inflight = write.open_table(INFLIGHT)?;
-            let mut attempts_table = write.open_table(ATTEMPTS)?;
-            let messages_table = write.open_table(MESSAGES)?;
-            let mut meta = write.open_table(META)?;
-            let mut next_delivery = meta
-                .get(META_NEXT_DELIVERY)?
-                .map(|v| v.value())
-                .unwrap_or(1);
-
-            for (seq, message_id) in picked {
-                ready.remove((queue_id, seq))?;
-                let attempts = attempts_table
-                    .get(message_id)?
-                    .map(|v| v.value())
-                    .unwrap_or(0)
-                    + 1;
-                attempts_table.insert(message_id, attempts)?;
-
-                let raw = messages_table.get(message_id)?.ok_or_else(|| {
-                    Error::Invalid("ready entry points at a missing message".into())
-                })?;
-                let record = MessageRecord::decode(raw.value())?;
-
+            let mut update = tx.prepare(
+                "UPDATE entries
+                 SET state = 'inflight', delivery_id = ?1,
+                     lease_deadline_ms = ?2, attempts = attempts + 1
+                 WHERE entry_id = ?3 AND state = 'ready'",
+            )?;
+            for entry in picked {
                 let delivery_id = next_delivery;
                 next_delivery += 1;
                 let deadline_ms = now.saturating_add(lease_ms);
-                let inflight_record = DeliveryRecord {
-                    delivery_id,
-                    queue_id,
-                    deadline_ms,
-                };
-                let encoded = inflight_record.encode();
-                inflight.insert(message_id, encoded.as_slice())?;
-
+                let changed = update.execute(params![
+                    to_i64(delivery_id)?,
+                    to_i64(deadline_ms)?,
+                    entry.entry_id,
+                ])?;
+                if changed != 1 {
+                    return Err(Error::Invalid(
+                        "ready entry changed during claim".to_string(),
+                    ));
+                }
                 deliveries.push(Delivery {
                     token: DeliveryToken {
-                        message_id,
+                        message_id: from_i64(entry.entry_id)?,
                         delivery_id,
                     },
                     queue: queue.to_string(),
                     queue_id,
-                    message_id,
-                    payload: record.payload,
-                    content_type: record.content_type,
-                    correlation_id: record.correlation_id,
-                    reply_to: record.reply_to,
-                    application_message_id: record.message_id,
-                    attempts,
+                    message_id: from_i64(entry.entry_id)?,
+                    payload: entry.payload,
+                    content_type: entry.content_type,
+                    correlation_id: entry.correlation_id,
+                    reply_to: entry.reply_to,
+                    application_message_id: entry.application_message_id,
+                    attempts: from_i64(entry.attempts)? + 1,
                     deadline_ms,
                 });
             }
-            meta.insert(META_NEXT_DELIVERY, next_delivery)?;
         }
-        write.commit()?;
+        set_meta(&tx, META_NEXT_DELIVERY, next_delivery)?;
+        tx.commit()?;
         Ok(Some(deliveries))
     }
 
@@ -481,110 +500,82 @@ impl Ante {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        let db = self.db()?;
-        let write = db.begin_write()?;
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut outcomes = Vec::with_capacity(tokens.len());
-        {
-            let mut inflight = write.open_table(INFLIGHT)?;
-            let mut messages = write.open_table(MESSAGES)?;
-            let mut attempts = write.open_table(ATTEMPTS)?;
-            for token in tokens {
-                let existing = {
-                    let raw = inflight.get(token.message_id)?;
-                    raw.map(|value| DeliveryRecord::decode(value.value()))
-                        .transpose()?
-                };
-                match existing {
-                    None => outcomes.push(AckOutcome::Unknown),
-                    Some(record) if record.delivery_id != token.delivery_id => {
-                        outcomes.push(AckOutcome::Stale)
-                    }
-                    Some(_) => {
-                        inflight.remove(token.message_id)?;
-                        messages.remove(token.message_id)?;
-                        attempts.remove(token.message_id)?;
-                        outcomes.push(AckOutcome::Acked);
-                    }
+        for token in tokens {
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT delivery_id FROM entries
+                     WHERE entry_id = ?1 AND state = 'inflight'",
+                    [to_i64(token.message_id)?],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match current {
+                None => outcomes.push(AckOutcome::Unknown),
+                Some(delivery_id) if from_i64(delivery_id)? != token.delivery_id => {
+                    outcomes.push(AckOutcome::Stale)
+                }
+                Some(_) => {
+                    tx.execute(
+                        "DELETE FROM entries
+                         WHERE entry_id = ?1 AND state = 'inflight' AND delivery_id = ?2",
+                        params![to_i64(token.message_id)?, to_i64(token.delivery_id)?],
+                    )?;
+                    outcomes.push(AckOutcome::Acked);
                 }
             }
         }
-        write.commit()?;
+        tx.commit()?;
         Ok(outcomes)
     }
 
     pub fn requeue(&self, token: &DeliveryToken) -> Result<RequeueOutcome> {
-        let db = self.db()?;
-        let write = db.begin_write()?;
-        let outcome = {
-            let mut inflight = write.open_table(INFLIGHT)?;
-            let existing = {
-                let raw = inflight.get(token.message_id)?;
-                raw.map(|value| DeliveryRecord::decode(value.value()))
-                    .transpose()?
-            };
-            match existing {
-                None => RequeueOutcome::Unknown,
-                Some(record) if record.delivery_id != token.delivery_id => RequeueOutcome::Stale,
-                Some(record) => {
-                    inflight.remove(token.message_id)?;
-                    push_ready(&write, token.message_id, record.queue_id)?;
-                    RequeueOutcome::Requeued
-                }
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT queue_id, delivery_id FROM entries
+                 WHERE entry_id = ?1 AND state = 'inflight'",
+                [to_i64(token.message_id)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let outcome = match current {
+            None => RequeueOutcome::Unknown,
+            Some((_queue_id, delivery_id)) if from_i64(delivery_id)? != token.delivery_id => {
+                RequeueOutcome::Stale
+            }
+            Some((queue_id, _)) => {
+                requeue_entry(&tx, token.message_id, queue_id)?;
+                RequeueOutcome::Requeued
             }
         };
-        write.commit()?;
+        tx.commit()?;
         Ok(outcome)
     }
 
     /// Requeue deliveries whose lease expired. Returns how many were returned.
     pub fn recover_expired(&self) -> Result<u64> {
-        let now = now_ms();
-        let db = self.db()?;
-        let write = db.begin_write()?;
-        let recovered = requeue_inflight(&write, |record| record.deadline_ms <= now)?;
-        if recovered == 0 {
-            write.abort()?;
-        } else {
-            write.commit()?;
-        }
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recovered = requeue_expired_tx(&tx, now_ms())?;
+        tx.commit()?;
         Ok(recovered)
     }
 
     /// Remove all ready messages from a queue. In-flight messages are untouched.
     pub fn purge(&self, queue: &str) -> Result<u64> {
-        let db = self.db()?;
-        let write = db.begin_write()?;
-        let found = {
-            let queues = write.open_table(QUEUES)?;
-            let value = queues.get(queue)?.map(|entry| entry.value());
-            value
-        };
-        let queue_id = found.ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
-        let entries: Vec<(u64, u64)> = {
-            let ready = write.open_table(READY)?;
-            let mut out = Vec::new();
-            for item in ready.range((queue_id, 0u64)..=(queue_id, u64::MAX))? {
-                let (key, value) = item?;
-                out.push((key.value().1, value.value()));
-            }
-            out
-        };
-        if entries.is_empty() {
-            write.abort()?;
-            return Ok(0);
-        }
-        {
-            let mut ready = write.open_table(READY)?;
-            let mut messages = write.open_table(MESSAGES)?;
-            let mut attempts = write.open_table(ATTEMPTS)?;
-            for (seq, message_id) in &entries {
-                ready.remove((queue_id, *seq))?;
-                messages.remove(*message_id)?;
-                attempts.remove(*message_id)?;
-            }
-        }
-        write.commit()?;
-        Ok(entries.len() as u64)
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let queue_id = queue_id_tx(&tx, queue)?;
+        let removed = tx.execute(
+            "DELETE FROM entries WHERE queue_id = ?1 AND state = 'ready'",
+            [to_i64(queue_id)?],
+        )?;
+        tx.commit()?;
+        Ok(removed as u64)
     }
 
     /// Delete a queue and every message that belongs to it.
@@ -600,69 +591,20 @@ impl Ante {
     }
 
     fn delete_queue_checked(&self, queue: &str, require_empty: bool) -> Result<Option<u64>> {
-        let db = self.db()?;
-        let write = db.begin_write()?;
-        let found = {
-            let queues = write.open_table(QUEUES)?;
-            let value = queues.get(queue)?.map(|entry| entry.value());
-            value
-        };
-        let queue_id = found.ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
-
-        let ready_entries: Vec<(u64, u64)> = {
-            let ready = write.open_table(READY)?;
-            let mut out = Vec::new();
-            for item in ready.range((queue_id, 0u64)..=(queue_id, u64::MAX))? {
-                let (key, value) = item?;
-                out.push((key.value().1, value.value()));
-            }
-            out
-        };
-        let inflight_entries: Vec<u64> = {
-            let inflight = write.open_table(INFLIGHT)?;
-            let mut out = Vec::new();
-            for item in inflight.iter()? {
-                let (key, value) = item?;
-                let record = DeliveryRecord::decode(value.value())?;
-                if record.queue_id == queue_id {
-                    out.push(key.value());
-                }
-            }
-            out
-        };
-
-        if require_empty && (!ready_entries.is_empty() || !inflight_entries.is_empty()) {
-            write.abort()?;
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let queue_id = queue_id_tx(&tx, queue)?;
+        let total: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM entries WHERE queue_id = ?1",
+            [to_i64(queue_id)?],
+            |row| row.get(0),
+        )?;
+        if require_empty && total != 0 {
             return Ok(None);
         }
-
-        {
-            let mut ready = write.open_table(READY)?;
-            let mut inflight = write.open_table(INFLIGHT)?;
-            let mut messages = write.open_table(MESSAGES)?;
-            let mut attempts = write.open_table(ATTEMPTS)?;
-            for (seq, message_id) in &ready_entries {
-                ready.remove((queue_id, *seq))?;
-                messages.remove(*message_id)?;
-                attempts.remove(*message_id)?;
-            }
-            for message_id in &inflight_entries {
-                inflight.remove(*message_id)?;
-                messages.remove(*message_id)?;
-                attempts.remove(*message_id)?;
-            }
-        }
-        {
-            let mut queues = write.open_table(QUEUES)?;
-            queues.remove(queue)?;
-        }
-        {
-            let mut seq = write.open_table(SEQ)?;
-            seq.remove(queue_id)?;
-        }
-
-        write.commit()?;
-        Ok(Some((ready_entries.len() + inflight_entries.len()) as u64))
+        tx.execute("DELETE FROM queues WHERE id = ?1", [to_i64(queue_id)?])?;
+        tx.commit()?;
+        Ok(Some(total as u64))
     }
 
     /// Queue name that owns an in-flight delivery token.
@@ -670,113 +612,328 @@ impl Ante {
     /// Returns `None` for unknown or stale tokens. Used by network adapters to
     /// authorize settlement without trusting the client-provided token.
     pub fn queue_for_token(&self, token: &DeliveryToken) -> Result<Option<String>> {
-        let db = self.db()?;
-        let read = db.begin_read()?;
-        let inflight = read.open_table(INFLIGHT)?;
-        let Some(raw) = inflight.get(token.message_id)? else {
-            return Ok(None);
-        };
-        let record = DeliveryRecord::decode(raw.value())?;
-        if record.delivery_id != token.delivery_id {
-            return Ok(None);
-        }
-        let queues = read.open_table(QUEUES)?;
-        for entry in queues.iter()? {
-            let (name, id) = entry?;
-            if id.value() == record.queue_id {
-                return Ok(Some(name.value().to_string()));
-            }
-        }
-        Ok(None)
+        self.with_reader(|reader| {
+            let name: Option<String> = reader
+                .query_row(
+                    "SELECT q.name
+                     FROM entries e JOIN queues q ON q.id = e.queue_id
+                     WHERE e.entry_id = ?1 AND e.state = 'inflight'
+                       AND e.delivery_id = ?2",
+                    params![to_i64(token.message_id)?, to_i64(token.delivery_id)?],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(name)
+        })
     }
 
     pub fn info(&self, queue: &str) -> Result<QueueInfo> {
-        let db = self.db()?;
-        let read = db.begin_read()?;
-        let found = {
-            let queues = read.open_table(QUEUES)?;
-            queues.get(queue)?.map(|value| value.value())
-        };
-        let id = found.ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
-
-        let ready_table = read.open_table(READY)?;
-        let mut ready = 0u64;
-        for item in ready_table.range((id, 0u64)..=(id, u64::MAX))? {
-            item?;
-            ready += 1;
-        }
-        drop(ready_table);
-
-        let inflight_table = read.open_table(INFLIGHT)?;
-        let mut inflight = 0u64;
-        for item in inflight_table.iter()? {
-            let (_, value) = item?;
-            let record = DeliveryRecord::decode(value.value())?;
-            if record.queue_id == id {
-                inflight += 1;
-            }
-        }
-
-        Ok(QueueInfo {
-            name: queue.to_string(),
-            id,
-            ready,
-            inflight,
+        self.with_reader(|reader| {
+            let id: Option<i64> = reader
+                .query_row("SELECT id FROM queues WHERE name = ?1", [queue], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let id = id.ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
+            let (ready, inflight): (i64, i64) = reader.query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN state = 'ready' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'inflight' THEN 1 ELSE 0 END), 0)
+                 FROM entries WHERE queue_id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok(QueueInfo {
+                name: queue.to_string(),
+                id: from_i64(id)?,
+                ready: ready as u64,
+                inflight: inflight as u64,
+            })
         })
     }
 
     pub fn list_queues(&self) -> Result<Vec<QueueInfo>> {
-        let names: Vec<String> = {
-            let db = self.db()?;
-            let read = db.begin_read()?;
-            let queues = read.open_table(QUEUES)?;
+        self.with_reader(|reader| {
+            let mut statement = reader.prepare(
+                "SELECT q.id, q.name,
+                    COALESCE(SUM(CASE WHEN e.state = 'ready' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN e.state = 'inflight' THEN 1 ELSE 0 END), 0)
+                 FROM queues q LEFT JOIN entries e ON e.queue_id = q.id
+                 GROUP BY q.id, q.name
+                 ORDER BY q.name",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
             let mut out = Vec::new();
-            for item in queues.iter()? {
-                let (name, _) = item?;
-                out.push(name.value().to_string());
+            for row in rows {
+                let (id, name, ready, inflight) = row?;
+                out.push(QueueInfo {
+                    id: from_i64(id)?,
+                    name,
+                    ready: ready as u64,
+                    inflight: inflight as u64,
+                });
             }
-            out
-        };
-        names.into_iter().map(|name| self.info(&name)).collect()
+            Ok(out)
+        })
     }
 }
 
-fn push_ready(write: &WriteTransaction, message_id: u64, queue_id: u64) -> Result<()> {
-    let mut ready = write.open_table(READY)?;
-    let mut seq = write.open_table(SEQ)?;
-    let next = seq.get(queue_id)?.map(|v| v.value()).unwrap_or(1);
-    ready.insert((queue_id, next), message_id)?;
-    seq.insert(queue_id, next + 1)?;
+struct PickedEntry {
+    entry_id: i64,
+    payload: Vec<u8>,
+    content_type: Option<String>,
+    application_message_id: Option<String>,
+    correlation_id: Option<String>,
+    reply_to: Option<String>,
+    attempts: i64,
+    _ready_seq: i64,
+}
+
+fn acquire_lock(path: &Path) -> Result<File> {
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Error::EngineOpen(path.display().to_string())
+        } else {
+            Error::from(error)
+        }
+    })?;
+    Ok(file)
+}
+
+fn reject_foreign_file(path: &Path) -> Result<()> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::from(error)),
+    };
+    if !metadata.is_file() {
+        return Err(Error::UnsupportedFormat(format!(
+            "database path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+    let mut magic = [0u8; 16];
+    let mut file = File::open(path)?;
+    let read = file.read(&mut magic)?;
+    if read != magic.len() || &magic != b"SQLite format 3\0" {
+        return Err(Error::UnsupportedFormat(format!(
+            "{} is not a SQLite database",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
-fn requeue_inflight(
-    write: &WriteTransaction,
-    predicate: impl Fn(DeliveryRecord) -> bool,
-) -> Result<u64> {
-    let targets: Vec<(u64, DeliveryRecord)> = {
-        let inflight = write.open_table(INFLIGHT)?;
+fn configure(connection: &Connection, cache_kib: i64, writable: bool) -> Result<()> {
+    connection.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    if writable {
+        let mode: String =
+            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(Error::Invalid(format!(
+                "SQLite refused WAL mode (got {mode})"
+            )));
+        }
+        connection.execute_batch("PRAGMA synchronous = FULL;")?;
+    }
+    connection.execute_batch(&format!("PRAGMA cache_size = -{cache_kib};"))?;
+    Ok(())
+}
+
+fn writer_cache_kib(options: &Options) -> i64 {
+    ((options.cache_size / 2).max(1024 * 1024) / 1024) as i64
+}
+
+fn reader_cache_kib(options: &Options) -> i64 {
+    ((options.cache_size / 8).max(512 * 1024) / 1024) as i64
+}
+
+fn initialize_or_validate(connection: &mut Connection) -> Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let application_id: i64 =
+        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let table_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if version == 0 && table_count == 0 && application_id == 0 {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(SCHEMA)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+            params![META_SCHEMA, to_i64(SCHEMA_VERSION)?],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, 1)",
+            [META_NEXT_QUEUE],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, 1)",
+            [META_NEXT_MESSAGE],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, 1)",
+            [META_NEXT_DELIVERY],
+        )?;
+        tx.commit()?;
+        connection.execute_batch(&format!(
+            "PRAGMA application_id = {APPLICATION_ID}; PRAGMA user_version = {SCHEMA_VERSION};"
+        ))?;
+        return Ok(());
+    }
+
+    if application_id != APPLICATION_ID {
+        return Err(Error::UnsupportedFormat(
+            "SQLite database was not created by Ante".into(),
+        ));
+    }
+    if version != SCHEMA_VERSION as i64 {
+        return Err(Error::UnsupportedFormat(format!(
+            "unsupported database schema version {version}"
+        )));
+    }
+    let stored: Option<i64> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            [META_SCHEMA],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored != Some(SCHEMA_VERSION as i64) {
+        return Err(Error::UnsupportedFormat(
+            "database metadata schema does not match user_version".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn queue_id_tx(tx: &Transaction<'_>, queue: &str) -> Result<u64> {
+    let id: Option<i64> = tx
+        .query_row("SELECT id FROM queues WHERE name = ?1", [queue], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    from_i64(id.ok_or_else(|| Error::QueueNotFound(queue.to_string()))?)
+}
+
+fn next_meta(tx: &Transaction<'_>, key: &str) -> Result<u64> {
+    let value: Option<i64> = tx
+        .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let value = from_i64(value.ok_or_else(|| Error::Invalid(format!("missing metadata {key}")))?)?;
+    set_meta(
+        tx,
+        key,
+        value
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("metadata counter overflow".into()))?,
+    )?;
+    Ok(value)
+}
+
+fn set_meta(tx: &Transaction<'_>, key: &str, value: u64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, to_i64(value)?],
+    )?;
+    Ok(())
+}
+
+fn queue_next_seq(tx: &Transaction<'_>, queue_id: i64) -> Result<u64> {
+    let value: i64 = tx.query_row(
+        "SELECT next_ready_seq FROM queues WHERE id = ?1",
+        [queue_id],
+        |row| row.get(0),
+    )?;
+    from_i64(value)
+}
+
+fn set_queue_next_seq(tx: &Transaction<'_>, queue_id: i64, value: u64) -> Result<()> {
+    tx.execute(
+        "UPDATE queues SET next_ready_seq = ?1 WHERE id = ?2",
+        params![to_i64(value)?, queue_id],
+    )?;
+    Ok(())
+}
+
+fn requeue_entry(tx: &Transaction<'_>, entry_id: u64, queue_id: i64) -> Result<()> {
+    let next = queue_next_seq(tx, queue_id)?;
+    tx.execute(
+        "UPDATE entries
+         SET state = 'ready', ready_seq = ?1, delivery_id = NULL, lease_deadline_ms = NULL
+         WHERE entry_id = ?2 AND state = 'inflight'",
+        params![to_i64(next)?, to_i64(entry_id)?],
+    )?;
+    set_queue_next_seq(
+        tx,
+        queue_id,
+        next.checked_add(1)
+            .ok_or_else(|| Error::Invalid("ready sequence overflow".into()))?,
+    )
+}
+
+fn requeue_expired_tx(tx: &Transaction<'_>, now: u64) -> Result<u64> {
+    let targets: Vec<(i64, i64)> = {
+        let mut statement = tx.prepare(
+            "SELECT entry_id, queue_id FROM entries
+             WHERE state = 'inflight' AND lease_deadline_ms <= ?1
+             ORDER BY entry_id",
+        )?;
+        let rows = statement.query_map([to_i64(now)?], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
         let mut out = Vec::new();
-        for item in inflight.iter()? {
-            let (key, value) = item?;
-            let record = DeliveryRecord::decode(value.value())?;
-            if predicate(record) {
-                out.push((key.value(), record));
-            }
+        for row in rows {
+            out.push(row?);
         }
         out
     };
-    if targets.is_empty() {
-        return Ok(0);
+    for (entry_id, queue_id) in &targets {
+        requeue_entry(tx, from_i64(*entry_id)?, *queue_id)?;
     }
-    let mut ready = write.open_table(READY)?;
-    let mut seq = write.open_table(SEQ)?;
-    let mut inflight = write.open_table(INFLIGHT)?;
-    for (message_id, record) in &targets {
-        let next = seq.get(record.queue_id)?.map(|v| v.value()).unwrap_or(1);
-        ready.insert((record.queue_id, next), *message_id)?;
-        seq.insert(record.queue_id, next + 1)?;
-        inflight.remove(*message_id)?;
+    Ok(targets.len() as u64)
+}
+
+fn requeue_all_inflight(tx: &Transaction<'_>) -> Result<u64> {
+    let targets: Vec<(i64, i64)> = {
+        let mut statement = tx.prepare(
+            "SELECT entry_id, queue_id FROM entries
+             WHERE state = 'inflight'
+             ORDER BY entry_id",
+        )?;
+        let rows =
+            statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out
+    };
+    for (entry_id, queue_id) in &targets {
+        requeue_entry(tx, from_i64(*entry_id)?, *queue_id)?;
     }
     Ok(targets.len() as u64)
 }
@@ -794,6 +951,14 @@ fn validate_name(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn to_i64(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| Error::Invalid("integer exceeds SQLite range".into()))
+}
+
+fn from_i64(value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::Invalid("negative integer in storage".into()))
 }
 
 fn now_ms() -> u64 {

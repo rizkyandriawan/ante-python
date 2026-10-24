@@ -12,7 +12,7 @@ from ante import Ante, AnteError, BasicProperties
 class ChannelTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="ante-ffi-")
-        self.path = Path(self.directory.name) / "queue.redb"
+        self.path = Path(self.directory.name) / "queue.sqlite3"
         self.ante = Ante.open(self.path)
         self.ch = self.ante.channel()
         self.ch.queue_declare("jobs")
@@ -293,7 +293,7 @@ class LifecycleTests(unittest.TestCase):
                     with Ante.open() as ante:
                         ante.declare("jobs")
                         ante.publish("jobs", "persisted")
-                self.assertTrue(Path(".ante/ante.redb").is_file())
+                self.assertTrue(Path(".ante/ante.sqlite3").is_file())
                 with Ante.open() as ante:
                     self.assertEqual(ante.take("jobs")[0].payload, "persisted")
             finally:

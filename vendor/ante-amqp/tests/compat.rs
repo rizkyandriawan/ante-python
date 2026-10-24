@@ -72,7 +72,7 @@ impl Harness {
 
     async fn start_with_options(options: ante_amqp::ServerOptions) -> Self {
         let dir = TempDir::new();
-        let ante = Arc::new(Ante::open(dir.path.join("ante.redb")).unwrap());
+        let ante = Arc::new(Ante::open(dir.path.join("ante.sqlite3")).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = oneshot::channel();
@@ -686,7 +686,7 @@ async fn consume_preserves_message_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_shutdown_stops_active_connections_and_requeues() {
     let dir = TempDir::new();
-    let ante = Arc::new(Ante::open(dir.path.join("ante.redb")).unwrap());
+    let ante = Arc::new(Ante::open(dir.path.join("ante.sqlite3")).unwrap());
     ante.declare_queue("shutdown").unwrap();
     ante.publish(
         "shutdown",
