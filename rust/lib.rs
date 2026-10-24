@@ -153,9 +153,11 @@ impl Engine {
     ) -> PyResult<(String, u16)> {
         py.allow_threads(|| {
             let security = match security_path {
-                Some(path) => Some(Arc::new(Security::load(&path).map_err(|error| {
-                    NativeError::new_err(("SECURITY", error.to_string()))
-                })?)),
+                Some(path) => {
+                    Some(Arc::new(Security::load(&path).map_err(|error| {
+                        NativeError::new_err(("SECURITY", error.to_string()))
+                    })?))
+                }
                 None => None,
             };
             let guard = self
