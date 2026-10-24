@@ -65,6 +65,33 @@ class Delivery:
             raise AnteError(outcome, "cannot discard delivery")
         self._settled = True
 
+    def complete(
+        self,
+        queue: str,
+        payload: Any,
+        *,
+        content_type: str | None = None,
+        message_id: str | None = None,
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        discard: bool = False,
+    ) -> int:
+        """Publish the result to ``queue`` and settle this delivery atomically."""
+        if self._settled:
+            raise AnteError("SETTLED", "delivery is already settled")
+        result = self._ante.complete(
+            self.token,
+            queue,
+            payload,
+            content_type=content_type,
+            message_id=message_id,
+            correlation_id=correlation_id,
+            reply_to=reply_to,
+            discard=discard,
+        )
+        self._settled = True
+        return result
+
 
 Handler = Callable[[Any, Delivery], None]
 ErrorPolicy = Callable[[BaseException, Delivery], str]
@@ -147,6 +174,36 @@ class Ante:
                 correlation_id or "",
                 reply_to or "",
             ),
+        )
+        self._wake.set()
+        return result
+
+    def complete(
+        self,
+        token: str,
+        queue: str,
+        payload: Any,
+        *,
+        content_type: str | None = None,
+        message_id: str | None = None,
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        discard: bool = False,
+    ) -> int:
+        """Settle a delivery and publish its result atomically."""
+        body, default_type = encode_payload(payload)
+        result = self._call(
+            "complete",
+            token,
+            queue,
+            body,
+            (
+                content_type or default_type,
+                message_id or "",
+                correlation_id or "",
+                reply_to or "",
+            ),
+            discard,
         )
         self._wake.set()
         return result

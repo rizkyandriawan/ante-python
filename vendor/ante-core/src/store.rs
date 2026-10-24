@@ -184,6 +184,27 @@ pub enum RequeueOutcome {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settlement {
+    Ack,
+    Discard,
+}
+
+impl Settlement {
+    fn outcome(self) -> MessageState {
+        match self {
+            Settlement::Ack => MessageState::Acked,
+            Settlement::Discard => MessageState::Discarded,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub outcome: AckOutcome,
+    pub message_id: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueInfo {
     pub name: String,
@@ -421,41 +442,7 @@ impl Ante {
             })
             .optional()?
             .ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
-        let mut next_message = next_meta(&tx, META_NEXT_MESSAGE)?;
-        let mut next_seq = queue_next_seq(&tx, queue_id)?;
-        let mut ids = Vec::with_capacity(messages.len());
-        let now = now_ms();
-
-        {
-            let mut insert = tx.prepare(
-                "INSERT INTO entries
-                 (entry_id, queue_id, ready_seq, payload, content_type,
-                  application_message_id, correlation_id, reply_to,
-                  state, delivery_id, lease_deadline_ms, attempts,
-                  created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', NULL, NULL, 0, ?9, ?9)",
-            )?;
-            for message in messages {
-                let entry_id = next_message;
-                next_message += 1;
-                insert.execute(params![
-                    to_i64(entry_id)?,
-                    queue_id,
-                    to_i64(next_seq)?,
-                    message.payload,
-                    message.content_type,
-                    message.message_id,
-                    message.correlation_id,
-                    message.reply_to,
-                    to_i64(now)?,
-                ])?;
-                next_seq += 1;
-                ids.push(entry_id);
-            }
-        }
-
-        set_meta(&tx, META_NEXT_MESSAGE, next_message)?;
-        set_queue_next_seq(&tx, queue_id, next_seq)?;
+        let ids = insert_messages_tx(&tx, queue_id, messages, now_ms())?;
         tx.commit()?;
         Ok(ids)
     }
@@ -628,6 +615,78 @@ impl Ante {
     pub fn discard(&self, token: &DeliveryToken) -> Result<AckOutcome> {
         let mut outcomes = self.discard_batch(std::slice::from_ref(token))?;
         Ok(outcomes.remove(0))
+    }
+
+    /// Settle one delivery and publish its result in the same transaction.
+    ///
+    /// A stale or unknown token does not publish. A missing destination queue,
+    /// oversized payload, or storage error aborts the whole transaction, so the
+    /// input delivery remains in flight.
+    pub fn complete(
+        &self,
+        token: &DeliveryToken,
+        queue: &str,
+        message: NewMessage,
+        settlement: Settlement,
+    ) -> Result<Completion> {
+        if message.payload.len() > self.options.max_payload_bytes {
+            return Err(Error::PayloadTooLarge {
+                size: message.payload.len(),
+                max: self.options.max_payload_bytes,
+            });
+        }
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT delivery_id FROM entries
+                 WHERE entry_id = ?1 AND state = 'inflight'",
+                [to_i64(token.message_id)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match current {
+            None => Ok(Completion {
+                outcome: AckOutcome::Unknown,
+                message_id: None,
+            }),
+            Some(delivery_id) if from_i64(delivery_id)? != token.delivery_id => Ok(Completion {
+                outcome: AckOutcome::Stale,
+                message_id: None,
+            }),
+            Some(_) => {
+                let queue_id: i64 = tx
+                    .query_row("SELECT id FROM queues WHERE name = ?1", [queue], |row| {
+                        row.get(0)
+                    })
+                    .optional()?
+                    .ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
+                let now = now_ms();
+                let message_id = insert_messages_tx(&tx, queue_id, vec![message], now)?.remove(0);
+                tx.execute(
+                    "UPDATE delivery_attempts
+                     SET finished_at_ms = ?1, outcome = ?2
+                     WHERE entry_id = ?3 AND delivery_id = ?4
+                       AND finished_at_ms IS NULL",
+                    params![
+                        to_i64(now)?,
+                        settlement.outcome().as_str(),
+                        to_i64(token.message_id)?,
+                        to_i64(token.delivery_id)?
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM entries
+                     WHERE entry_id = ?1 AND state = 'inflight' AND delivery_id = ?2",
+                    params![to_i64(token.message_id)?, to_i64(token.delivery_id)?],
+                )?;
+                tx.commit()?;
+                Ok(Completion {
+                    outcome: AckOutcome::Acked,
+                    message_id: Some(message_id),
+                })
+            }
+        }
     }
 
     fn settle_batch(
@@ -1171,6 +1230,47 @@ fn set_meta(tx: &Transaction<'_>, key: &str, value: u64) -> Result<()> {
         params![key, to_i64(value)?],
     )?;
     Ok(())
+}
+
+fn insert_messages_tx(
+    tx: &Transaction<'_>,
+    queue_id: i64,
+    messages: Vec<NewMessage>,
+    now: u64,
+) -> Result<Vec<u64>> {
+    let mut next_message = next_meta(tx, META_NEXT_MESSAGE)?;
+    let mut next_seq = queue_next_seq(tx, queue_id)?;
+    let mut ids = Vec::with_capacity(messages.len());
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO entries
+             (entry_id, queue_id, ready_seq, payload, content_type,
+              application_message_id, correlation_id, reply_to,
+              state, delivery_id, lease_deadline_ms, attempts,
+              created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', NULL, NULL, 0, ?9, ?9)",
+        )?;
+        for message in messages {
+            let entry_id = next_message;
+            next_message += 1;
+            insert.execute(params![
+                to_i64(entry_id)?,
+                queue_id,
+                to_i64(next_seq)?,
+                message.payload,
+                message.content_type,
+                message.message_id,
+                message.correlation_id,
+                message.reply_to,
+                to_i64(now)?,
+            ])?;
+            next_seq += 1;
+            ids.push(entry_id);
+        }
+    }
+    set_meta(tx, META_NEXT_MESSAGE, next_message)?;
+    set_queue_next_seq(tx, queue_id, next_seq)?;
+    Ok(ids)
 }
 
 fn queue_next_seq(tx: &Transaction<'_>, queue_id: i64) -> Result<u64> {

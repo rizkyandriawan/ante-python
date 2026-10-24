@@ -59,6 +59,30 @@ class SmokeTests(unittest.TestCase):
         self.assertIsNotNone(status["history"][0]["finished_at_ms"])
         self.assertIsNone(self.ante.message_status("jobs", message_id + 1))
 
+    def test_complete_publishes_result_and_acks(self):
+        self.ante.declare("results")
+        job_id = self.ante.publish("jobs", {"n": 1})
+        [delivery] = self.ante.take("jobs", max=1, wait_ms=1000)
+        result_id = delivery.complete(
+            "results", {"ok": True}, correlation_id="corr-1"
+        )
+        self.assertGreater(result_id, 0)
+        self.assertEqual(self.ante.info("jobs")["total"], 0)
+        self.assertEqual(self.ante.info("results")["ready"], 1)
+        self.assertEqual(self.ante.message_status("jobs", job_id)["state"], "acked")
+        [result] = self.ante.take("results", max=1, wait_ms=1000)
+        self.assertEqual(result.payload, {"ok": True})
+        self.assertEqual(result.correlation_id, "corr-1")
+        result.ack()
+
+    def test_complete_can_discard_the_input(self):
+        self.ante.declare("failed")
+        job_id = self.ante.publish("jobs", {"n": 1})
+        [delivery] = self.ante.take("jobs", max=1, wait_ms=1000)
+        delivery.complete("failed", {"error": "bad"}, discard=True)
+        self.assertEqual(self.ante.message_status("jobs", job_id)["state"], "discarded")
+        self.assertEqual(self.ante.info("failed")["ready"], 1)
+
     def test_publish_batch(self):
         ids = self.ante.publish_batch("jobs", [{"n": 1}, {"n": 2}, {"n": 3}])
         self.assertEqual(len(ids), 3)

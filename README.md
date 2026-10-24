@@ -169,6 +169,8 @@ Additional storage operations:
   queue deletion.
 - `delivery.discard()` permanently drops a message and records `discarded`
   instead of `acked`; the high-level `on_error` drop policy uses it.
+- `delivery.complete(queue, result, ...)` publishes the result and settles the
+  delivery in one transaction. Pass `discard=True` for terminal failures.
 - `purge(queue)`, `delete_queue(queue)`, `recover_expired()`.
 
 `publish` encodes dict/list values as JSON, strings as UTF-8, and bytes-like

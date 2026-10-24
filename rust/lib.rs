@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
-use ante_core::{AckOutcome, Ante, DeliveryToken, NewMessage, RequeueOutcome};
+use ante_core::{AckOutcome, Ante, DeliveryToken, NewMessage, RequeueOutcome, Settlement};
 use ante_security::Security;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -304,6 +304,47 @@ impl Engine {
                 },
             )
         })
+    }
+
+    #[pyo3(signature = (token, queue, payload, metadata, discard=false))]
+    fn complete(
+        &self,
+        py: Python<'_>,
+        token: String,
+        queue: String,
+        payload: Vec<u8>,
+        metadata: (String, String, String, String),
+        discard: bool,
+    ) -> PyResult<u64> {
+        let (content_type, message_id, correlation_id, reply_to) = metadata;
+        let completion = self.run(py, |engine| {
+            engine.complete(
+                &DeliveryToken::parse(&token)?,
+                &queue,
+                NewMessage {
+                    payload,
+                    content_type: Some(content_type),
+                    message_id: (!message_id.is_empty()).then_some(message_id),
+                    correlation_id: (!correlation_id.is_empty()).then_some(correlation_id),
+                    reply_to: (!reply_to.is_empty()).then_some(reply_to),
+                },
+                if discard {
+                    Settlement::Discard
+                } else {
+                    Settlement::Ack
+                },
+            )
+        })?;
+        match completion.outcome {
+            AckOutcome::Acked => completion
+                .message_id
+                .ok_or_else(|| NativeError::new_err(("INTERNAL", "completion has no message id"))),
+            AckOutcome::Stale => Err(NativeError::new_err(("STALE_DELIVERY", "stale delivery"))),
+            AckOutcome::Unknown => Err(NativeError::new_err((
+                "UNKNOWN_DELIVERY",
+                "unknown delivery",
+            ))),
+        }
     }
 
     fn publish_batch(
