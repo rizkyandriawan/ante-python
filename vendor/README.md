@@ -1,6 +1,6 @@
 # Vendored Ante crates
 
-Source: https://github.com/rizkyandriawan/ante, commit 6cdef84.
+Source: https://github.com/rizkyandriawan/ante, commit 1358f4e.
 `ante-core/src`, `ante-amqp/src`, and `ante-security/src` are copied unchanged;
 Cargo metadata is standalone. License: MIT (see ../LICENSE). Keep updates
 explicit and run the Rust tests plus the Python integration suite after updating.

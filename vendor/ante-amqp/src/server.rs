@@ -12,19 +12,19 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::frame::{
     channel_error_args, connection_error_args, parse_content_header, read_frame, write_content,
-    write_method, BasicProperties, Encoder, Frame, Parser, TableValue, BASIC_ACK, BASIC_CANCEL,
-    BASIC_CANCEL_OK, BASIC_CONSUME, BASIC_CONSUME_OK, BASIC_DELIVER, BASIC_GET, BASIC_GET_EMPTY,
-    BASIC_GET_OK, BASIC_NACK, BASIC_PUBLISH, BASIC_QOS, BASIC_QOS_OK, BASIC_RECOVER,
-    BASIC_RECOVER_OK, BASIC_REJECT, BASIC_RETURN, CHANNEL_CLOSE, CHANNEL_CLOSE_OK, CHANNEL_FLOW,
-    CHANNEL_FLOW_OK, CHANNEL_OPEN, CHANNEL_OPEN_OK, CLASS_BASIC, CLASS_CHANNEL, CLASS_CONFIRM,
-    CLASS_CONNECTION, CLASS_EXCHANGE, CLASS_QUEUE, CONFIRM_SELECT, CONFIRM_SELECT_OK,
-    CONNECTION_CLOSE, CONNECTION_CLOSE_OK, CONNECTION_OPEN, CONNECTION_OPEN_OK, CONNECTION_START,
-    CONNECTION_START_OK, CONNECTION_TUNE, CONNECTION_TUNE_OK, EXCHANGE_BIND, EXCHANGE_BIND_OK,
-    EXCHANGE_DECLARE, EXCHANGE_DELETE, EXCHANGE_DELETE_OK, FRAME_BODY, FRAME_HEADER,
-    FRAME_HEARTBEAT, FRAME_METHOD, QUEUE_BIND, QUEUE_BIND_OK, QUEUE_DECLARE, QUEUE_DECLARE_OK,
-    QUEUE_DELETE, QUEUE_DELETE_OK, QUEUE_PURGE, QUEUE_PURGE_OK, QUEUE_UNBIND, QUEUE_UNBIND_OK,
-    REPLY_ACCESS_REFUSED, REPLY_CHANNEL_ERROR, REPLY_COMMAND_INVALID, REPLY_FRAME_ERROR,
-    REPLY_NOT_ALLOWED, REPLY_NOT_FOUND, REPLY_NOT_IMPLEMENTED, REPLY_NO_ROUTE,
+    write_frame, write_method, BasicProperties, Encoder, Frame, Parser, TableValue, BASIC_ACK,
+    BASIC_CANCEL, BASIC_CANCEL_OK, BASIC_CONSUME, BASIC_CONSUME_OK, BASIC_DELIVER, BASIC_GET,
+    BASIC_GET_EMPTY, BASIC_GET_OK, BASIC_NACK, BASIC_PUBLISH, BASIC_QOS, BASIC_QOS_OK,
+    BASIC_RECOVER, BASIC_RECOVER_OK, BASIC_REJECT, BASIC_RETURN, CHANNEL_CLOSE, CHANNEL_CLOSE_OK,
+    CHANNEL_FLOW, CHANNEL_FLOW_OK, CHANNEL_OPEN, CHANNEL_OPEN_OK, CLASS_BASIC, CLASS_CHANNEL,
+    CLASS_CONFIRM, CLASS_CONNECTION, CLASS_EXCHANGE, CLASS_QUEUE, CONFIRM_SELECT,
+    CONFIRM_SELECT_OK, CONNECTION_CLOSE, CONNECTION_CLOSE_OK, CONNECTION_OPEN, CONNECTION_OPEN_OK,
+    CONNECTION_START, CONNECTION_START_OK, CONNECTION_TUNE, CONNECTION_TUNE_OK, EXCHANGE_BIND,
+    EXCHANGE_BIND_OK, EXCHANGE_DECLARE, EXCHANGE_DELETE, EXCHANGE_DELETE_OK, FRAME_BODY,
+    FRAME_HEADER, FRAME_HEARTBEAT, FRAME_METHOD, QUEUE_BIND, QUEUE_BIND_OK, QUEUE_DECLARE,
+    QUEUE_DECLARE_OK, QUEUE_DELETE, QUEUE_DELETE_OK, QUEUE_PURGE, QUEUE_PURGE_OK, QUEUE_UNBIND,
+    QUEUE_UNBIND_OK, REPLY_ACCESS_REFUSED, REPLY_CHANNEL_ERROR, REPLY_COMMAND_INVALID,
+    REPLY_FRAME_ERROR, REPLY_NOT_ALLOWED, REPLY_NOT_FOUND, REPLY_NOT_IMPLEMENTED, REPLY_NO_ROUTE,
     REPLY_PRECONDITION_FAILED, REPLY_UNEXPECTED_FRAME,
 };
 
@@ -37,17 +37,23 @@ const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const IDENTITY_INTERVAL: Duration = Duration::from_secs(5);
 const CONSUMER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const DEFAULT_ACK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const DEFAULT_HEARTBEAT_MS: u64 = 30_000;
+const CONNECTION_FORCED: u16 = 320;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {
     /// Lease applied to deliveries sent to consumers.
     pub lease_ms: u64,
+    /// Heartbeat interval advertised during connection tuning, in milliseconds.
+    /// Zero disables heartbeats; non-zero values are rounded up to one second.
+    pub heartbeat_ms: u64,
 }
 
 impl Default for ServerOptions {
     fn default() -> Self {
         ServerOptions {
             lease_ms: DEFAULT_ACK_TIMEOUT_MS,
+            heartbeat_ms: DEFAULT_HEARTBEAT_MS,
         }
     }
 }
@@ -126,6 +132,7 @@ async fn serve_loop(
                 let setup = ConnectionSetup {
                     ante: ante.clone(),
                     lease_ms: options.lease_ms,
+                    heartbeat_ms: options.heartbeat_ms,
                     registry: registry.clone(),
                     channel_registry: channel_registry.clone(),
                     queue_locks: queue_locks.clone(),
@@ -232,6 +239,11 @@ impl FrameWriter {
         write_content(&mut self.inner, channel, properties, body, self.frame_max).await?;
         self.inner.flush().await
     }
+
+    async fn heartbeat(&mut self) -> io::Result<()> {
+        write_frame(&mut self.inner, FRAME_HEARTBEAT, 0, &[]).await?;
+        self.inner.flush().await
+    }
 }
 
 struct Shared {
@@ -240,6 +252,7 @@ struct Shared {
     channels: Arc<Mutex<HashMap<u16, ChannelState>>>,
     frame_max: std::sync::atomic::AtomicU32,
     channel_max: std::sync::atomic::AtomicU16,
+    heartbeat_ms: AtomicU64,
     lease_ms: u64,
     shutdown: Arc<AtomicBool>,
     next_channel_generation: AtomicU64,
@@ -752,6 +765,7 @@ struct PendingPublish {
 struct ConnectionSetup {
     ante: Arc<Ante>,
     lease_ms: u64,
+    heartbeat_ms: u64,
     registry: Arc<ConsumerRegistry>,
     channel_registry: Arc<ChannelRegistry>,
     queue_locks: Arc<QueueLocks>,
@@ -766,7 +780,7 @@ async fn handle_connection(
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let (read_half, write_half) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half);
+    let reader = BufReader::new(read_half);
     let channels = Arc::new(Mutex::new(HashMap::new()));
     setup.channel_registry.add(&channels);
     let shared = Arc::new(Shared {
@@ -778,6 +792,11 @@ async fn handle_connection(
         channels,
         frame_max: std::sync::atomic::AtomicU32::new(SERVER_FRAME_MAX),
         channel_max: std::sync::atomic::AtomicU16::new(SERVER_CHANNEL_MAX),
+        heartbeat_ms: AtomicU64::new(if setup.heartbeat_ms == 0 {
+            0
+        } else {
+            setup.heartbeat_ms.max(1000)
+        }),
         lease_ms: setup.lease_ms,
         shutdown: Arc::new(AtomicBool::new(false)),
         next_channel_generation: AtomicU64::new(0),
@@ -792,19 +811,19 @@ async fn handle_connection(
         principal: std::sync::RwLock::new(None),
     });
 
-    let result = run_connection(&mut reader, &shared, stop).await;
+    let result = run_connection(reader, &shared, stop).await;
     shutdown_consumers(&shared).await;
     cleanup_all(&shared).await;
     result
 }
 
 async fn run_connection(
-    reader: &mut BufReader<StreamRead>,
+    mut reader: BufReader<StreamRead>,
     shared: &Arc<Shared>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let ok = if shared.security.is_some() {
-        match tokio::time::timeout(Duration::from_secs(10), handshake(reader, shared)).await {
+        match tokio::time::timeout(Duration::from_secs(10), handshake(&mut reader, shared)).await {
             Ok(result) => result?,
             Err(_) => {
                 return Err(io::Error::new(
@@ -814,44 +833,99 @@ async fn run_connection(
             }
         }
     } else {
-        handshake(reader, shared).await?
+        handshake(&mut reader, shared).await?
     };
     if !ok {
         return Ok(());
     }
 
-    loop {
-        let frame = tokio::select! {
-            _ = stop.changed() => return Ok(()),
-            frame = read_frame(reader, shared.frame_max.load(Ordering::Relaxed)) => match frame? {
-                Some(frame) => frame,
-                None => return Ok(()),
-            },
-        };
-        match frame.kind {
-            FRAME_HEARTBEAT => continue,
-            FRAME_METHOD => {
-                if handle_method(shared, frame).await? {
-                    return Ok(());
+    let frame_max = shared.frame_max.load(Ordering::Relaxed);
+    let (frame_tx, mut frames) = tokio::sync::mpsc::channel(16);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let frame = match read_frame(&mut reader, frame_max).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(err) => {
+                    let _ = frame_tx.send(Err(err)).await;
+                    break;
                 }
+            };
+            if frame_tx.send(Ok(frame)).await.is_err() {
+                break;
             }
-            FRAME_HEADER => {
-                if handle_header(shared, frame).await? {
-                    return Ok(());
+        }
+    });
+
+    let heartbeat_ms = shared.heartbeat_ms.load(Ordering::Relaxed);
+    let tick_ms = if heartbeat_ms == 0 {
+        86_400_000
+    } else {
+        (heartbeat_ms / 2).max(100)
+    };
+    let mut heartbeat_tick = tokio::time::interval(Duration::from_millis(tick_ms));
+    heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat_tick.tick().await;
+    let mut last_received = tokio::time::Instant::now();
+
+    let result = async {
+        loop {
+            tokio::select! {
+                _ = stop.changed() => break Ok(()),
+                frame = frames.recv() => {
+                    last_received = tokio::time::Instant::now();
+                    let frame = match frame {
+                        Some(Ok(frame)) => frame,
+                        Some(Err(err)) => break Err(err),
+                        None => break Ok(()),
+                    };
+                    match frame.kind {
+                        FRAME_HEARTBEAT => continue,
+                        FRAME_METHOD => {
+                            if handle_method(shared, frame).await? {
+                                break Ok(());
+                            }
+                        }
+                        FRAME_HEADER => {
+                            if handle_header(shared, frame).await? {
+                                break Ok(());
+                            }
+                        }
+                        FRAME_BODY => {
+                            if handle_body(shared, frame).await? {
+                                break Ok(());
+                            }
+                        }
+                        other => {
+                            let text = format!("unsupported frame type {other}");
+                            send_connection_close(shared, REPLY_FRAME_ERROR, &text, 0, 0).await?;
+                            break Ok(());
+                        }
+                    }
                 }
-            }
-            FRAME_BODY => {
-                if handle_body(shared, frame).await? {
-                    return Ok(());
+                _ = heartbeat_tick.tick(), if heartbeat_ms > 0 => {
+                    if last_received.elapsed()
+                        >= Duration::from_millis(heartbeat_ms.saturating_mul(2))
+                    {
+                        send_connection_close(
+                            shared,
+                            CONNECTION_FORCED,
+                            "heartbeat timeout",
+                            0,
+                            0,
+                        )
+                        .await?;
+                        break Ok(());
+                    }
+                    shared.writer.lock().await.heartbeat().await?;
                 }
-            }
-            other => {
-                let text = format!("unsupported frame type {other}");
-                send_connection_close(shared, REPLY_FRAME_ERROR, &text, 0, 0).await?;
-                return Ok(());
             }
         }
     }
+    .await;
+    reader_task.abort();
+    let _ = reader_task.await;
+    result
 }
 
 fn now_ms() -> u64 {
@@ -945,7 +1019,9 @@ async fn handshake(reader: &mut BufReader<StreamRead>, shared: &Arc<Shared>) -> 
 
     {
         let mut args = Encoder::new();
-        args.u16(SERVER_CHANNEL_MAX).u32(SERVER_FRAME_MAX).u16(0);
+        args.u16(SERVER_CHANNEL_MAX)
+            .u32(SERVER_FRAME_MAX)
+            .u16((shared.heartbeat_ms.load(Ordering::Relaxed) / 1000).min(u16::MAX as u64) as u16);
         let mut writer = shared.writer.lock().await;
         writer
             .method(0, CLASS_CONNECTION, CONNECTION_TUNE, &args.finish())
@@ -957,8 +1033,15 @@ async fn handshake(reader: &mut BufReader<StreamRead>, shared: &Arc<Shared>) -> 
         let mut parser = Parser::new(&tune_ok);
         let client_channel_max = parser.u16()?;
         let client_frame_max = parser.u32()?;
-        let _heartbeat = parser.u16()?;
+        let client_heartbeat = parser.u16()? as u64 * 1000;
         parser.finish()?;
+        let server_heartbeat = shared.heartbeat_ms.load(Ordering::Relaxed);
+        let heartbeat = match (client_heartbeat, server_heartbeat) {
+            (0, server) => server,
+            (client, 0) => client,
+            (client, server) => client.min(server),
+        };
+        shared.heartbeat_ms.store(heartbeat, Ordering::Relaxed);
         let frame_max = if client_frame_max == 0 {
             SERVER_FRAME_MAX
         } else {

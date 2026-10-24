@@ -8,7 +8,7 @@ use ante_amqp::frame::{
     method_payload, read_frame, write_frame, Encoder, TableValue, BASIC_PUBLISH, CHANNEL_OPEN,
     CHANNEL_OPEN_OK, CLASS_BASIC, CLASS_CHANNEL, CLASS_CONNECTION, CONNECTION_CLOSE,
     CONNECTION_OPEN, CONNECTION_OPEN_OK, CONNECTION_START, CONNECTION_START_OK, CONNECTION_TUNE,
-    CONNECTION_TUNE_OK, FRAME_BODY, FRAME_HEADER, FRAME_METHOD,
+    CONNECTION_TUNE_OK, FRAME_BODY, FRAME_HEADER, FRAME_HEARTBEAT, FRAME_METHOD,
 };
 use ante_core::Ante;
 use futures_util::StreamExt;
@@ -67,7 +67,11 @@ impl Harness {
     }
 
     async fn start_with_lease(lease_ms: u64) -> Self {
-        Self::start_with_options(ante_amqp::ServerOptions { lease_ms }).await
+        Self::start_with_options(ante_amqp::ServerOptions {
+            lease_ms,
+            ..Default::default()
+        })
+        .await
     }
 
     async fn start_with_options(options: ante_amqp::ServerOptions) -> Self {
@@ -1484,6 +1488,10 @@ fn is_connection_closed(result: &io::Result<Option<(u8, u16, Vec<u8>)>>) -> bool
 
 impl RawClient {
     async fn connect(port: u16) -> Self {
+        Self::connect_with_heartbeat(port, 0).await
+    }
+
+    async fn connect_with_heartbeat(port: u16, heartbeat: u16) -> Self {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         stream.write_all(b"AMQP\x00\x00\x09\x01").await.unwrap();
 
@@ -1514,7 +1522,7 @@ impl RawClient {
         );
 
         let mut args = Encoder::new();
-        args.u16(16).u32(131_072).u16(0);
+        args.u16(16).u32(131_072).u16(heartbeat);
         write_frame(
             &mut stream,
             FRAME_METHOD,
@@ -1579,6 +1587,47 @@ impl RawClient {
         self.expect_method(channel, CLASS_CHANNEL, CHANNEL_OPEN_OK)
             .await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_timeout_closes_a_silent_peer() {
+    let harness = Harness::start_with_options(ante_amqp::ServerOptions {
+        heartbeat_ms: 1000,
+        ..Default::default()
+    })
+    .await;
+    let mut raw = RawClient::connect_with_heartbeat(harness.port, 1).await;
+
+    let heartbeat = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (kind, channel, _) = raw.read().await.unwrap().unwrap();
+            if kind == FRAME_HEARTBEAT {
+                assert_eq!(channel, 0);
+                break;
+            }
+            assert_eq!(kind, FRAME_METHOD);
+        }
+    })
+    .await;
+    heartbeat.expect("server did not send a heartbeat");
+
+    let close = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match raw.read().await.unwrap() {
+                None => return None,
+                Some((FRAME_HEARTBEAT, 0, _)) => continue,
+                Some((FRAME_METHOD, 0, payload)) => {
+                    assert_eq!(raw_method(&payload), (CLASS_CONNECTION, CONNECTION_CLOSE));
+                    return Some(close_code(&payload));
+                }
+                Some(other) => panic!("unexpected frame while waiting for close: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("server did not close a silent peer")
+    .expect("connection closed without a connection.close frame");
+    assert_eq!(close, 320);
 }
 
 #[tokio::test(flavor = "multi_thread")]
