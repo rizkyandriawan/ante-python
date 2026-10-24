@@ -36,6 +36,7 @@ const CONSUMER_POLL: Duration = Duration::from_millis(1);
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const IDENTITY_INTERVAL: Duration = Duration::from_secs(5);
 const CONSUMER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+const DEFAULT_ACK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {
@@ -46,7 +47,7 @@ pub struct ServerOptions {
 impl Default for ServerOptions {
     fn default() -> Self {
         ServerOptions {
-            lease_ms: ante_core::DEFAULT_LEASE_MS,
+            lease_ms: DEFAULT_ACK_TIMEOUT_MS,
         }
     }
 }
