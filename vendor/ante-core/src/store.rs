@@ -911,10 +911,15 @@ impl Ante {
             else {
                 return Ok(None);
             };
+            let latest = MessageState::parse(outcome)?;
+            let state = match latest {
+                MessageState::Acked => MessageState::Acked,
+                _ => MessageState::Discarded,
+            };
             Ok(Some(MessageStatus {
                 queue: stored_queue.clone(),
                 message_id,
-                state: MessageState::parse(outcome)?,
+                state,
                 attempts: from_i64(*last_attempt)?,
                 created_at_ms: from_i64(*created_at_ms)?,
                 updated_at_ms: from_i64(last_finished.unwrap_or(*last_started))?,

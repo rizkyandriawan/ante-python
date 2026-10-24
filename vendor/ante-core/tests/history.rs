@@ -130,6 +130,21 @@ fn deleting_a_queue_discards_unfinished_attempts_but_keeps_history() {
 }
 
 #[test]
+fn deleting_a_queue_marks_ready_messages_discarded() {
+    let temp = TempDir::new();
+    let ante = Ante::open(temp.path.join("ante.sqlite3")).unwrap();
+    ante.declare_queue("jobs").unwrap();
+    let id = ante.publish("jobs", message(b"requeued")).unwrap();
+    let delivery = ante.take("jobs", 1, 30_000).unwrap().remove(0);
+    ante.requeue(&delivery.token).unwrap();
+
+    ante.delete_queue("jobs").unwrap();
+    let status = ante.message_status("jobs", id).unwrap().unwrap();
+    assert_eq!(status.state, MessageState::Discarded);
+    assert_eq!(status.history[0].outcome, MessageState::Requeued);
+}
+
+#[test]
 fn version_one_database_is_migrated_with_timestamps() {
     let temp = TempDir::new();
     let path = temp.path.join("ante.sqlite3");
