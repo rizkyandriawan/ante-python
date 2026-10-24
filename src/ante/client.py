@@ -36,6 +36,7 @@ class Delivery:
     application_message_id: str | None
     deadline_ms: int
     _ante: Ante = field(repr=False)
+    _lease_ms: int = field(default=30_000, repr=False)
     _settled: bool = field(default=False, repr=False)
 
     @property
@@ -64,6 +65,12 @@ class Delivery:
         if outcome != "OK":
             raise AnteError(outcome, "cannot discard delivery")
         self._settled = True
+
+    def touch(self, lease_ms: int | None = None) -> None:
+        """Extend the in-flight lease for this delivery."""
+        self._ante.touch(
+            self.token, self._lease_ms if lease_ms is None else lease_ms
+        )
 
     def complete(
         self,
@@ -244,9 +251,11 @@ class Ante:
 
     def _take_now(self, queue, max, lease_ms, parse=None, queue_id=None):
         records = self._call("take", queue, max, lease_ms, queue_id)
-        return [self._delivery(record, parse) for record in records]
+        return [self._delivery(record, parse, lease_ms) for record in records]
 
-    def _delivery(self, record: Any, parse: Parser | None) -> Delivery:
+    def _delivery(
+        self, record: Any, parse: Parser | None, lease_ms: int = 30_000
+    ) -> Delivery:
         raw = bytes(record.payload)
         return Delivery(
             token=record.token,
@@ -322,6 +331,11 @@ class Ante:
 
     def queue_exists(self, queue: str) -> bool:
         return self._call("queue_exists", queue)
+
+    def touch(self, token: str, lease_ms: int = 30_000) -> None:
+        outcome = self._call("touch", token, lease_ms)
+        if outcome != "OK":
+            raise AnteError(outcome, "cannot extend delivery lease")
 
     def prune_history(self) -> int:
         """Apply the attempt-history retention policy and return rows removed."""

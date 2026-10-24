@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
-use ante_core::{AckOutcome, Ante, DeliveryToken, NewMessage, Options, RequeueOutcome, Settlement};
+use ante_core::{
+    AckOutcome, Ante, DeliveryToken, NewMessage, Options, RequeueOutcome, Settlement, TouchOutcome,
+};
 use ante_security::Security;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -496,6 +498,19 @@ impl Engine {
 
     fn recover_expired(&self, py: Python<'_>) -> PyResult<u64> {
         self.run(py, |engine| engine.recover_expired())
+    }
+
+    fn touch(&self, py: Python<'_>, token: String, lease_ms: u64) -> PyResult<String> {
+        self.run(py, |engine| {
+            Ok(
+                match engine.touch(&DeliveryToken::parse(&token)?, lease_ms)? {
+                    TouchOutcome::Extended => "OK",
+                    TouchOutcome::Stale => "STALE_DELIVERY",
+                    TouchOutcome::Unknown => "UNKNOWN_DELIVERY",
+                }
+                .to_owned(),
+            )
+        })
     }
 
     fn prune_history(&self, py: Python<'_>) -> PyResult<u64> {

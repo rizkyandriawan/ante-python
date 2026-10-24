@@ -39,6 +39,16 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(info["ready"], 0)
         self.assertEqual(info["inflight"], 0)
 
+    def test_touch_extends_a_lease(self):
+        self.ante.publish("jobs", {"n": 1})
+        [delivery] = self.ante.take("jobs", max=1, lease_ms=5, wait_ms=1000)
+        delivery.touch()
+        time.sleep(0.02)
+        self.assertEqual(self.ante.recover_expired(), 0)
+        status = self.ante.message_status("jobs", delivery.message_id)
+        self.assertEqual(status["state"], "inflight")
+        delivery.ack()
+
     def test_message_status_and_history(self):
         message_id = self.ante.publish("jobs", {"n": 1})
         status = self.ante.message_status("jobs", message_id)

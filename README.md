@@ -78,7 +78,8 @@ GIL on standard CPython. Rust storage operations release the GIL while running;
 SQLite transactions are serialized inside the engine. Parallel callbacks can
 complete out of order. Delivery is **at-least-once**: jobs must tolerate retries.
 A lease defaults to 30 seconds; configure `lease_ms` in the high-level consumer
-for longer jobs. Lease renewal is not provided.
+for longer jobs. Call `delivery.touch()` to extend the lease while a handler is
+still working; renewal does not create a new attempt.
 
 The concurrency design follows Pika's official threaded-consumer examples:
 [Pika 1.3.2](https://github.com/pika/pika/blob/1.3.2/examples/basic_consumer_threaded.py)
@@ -159,6 +160,8 @@ via `asyncio.to_thread` in async endpoints.
 Additional storage operations:
 
 - `take(queue, max=1, lease_ms=30000, wait_ms=0, parse=None)` → deliveries.
+  Each `Delivery` has `touch(lease_ms=None)`, which extends its original lease
+  by default.
 - `Delivery.ack()` / `Delivery.requeue()`; delivery includes raw bytes, decoded
   payload, token, attempts, content type, correlation/reply metadata, application
   message ID, and lease deadline.

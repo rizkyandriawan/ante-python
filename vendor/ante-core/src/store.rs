@@ -198,6 +198,13 @@ pub enum RequeueOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchOutcome {
+    Extended,
+    Stale,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Settlement {
     Ack,
     Discard,
@@ -629,6 +636,50 @@ impl Ante {
     pub fn discard(&self, token: &DeliveryToken) -> Result<AckOutcome> {
         let mut outcomes = self.discard_batch(std::slice::from_ref(token))?;
         Ok(outcomes.remove(0))
+    }
+
+    /// Extend the lease of an in-flight delivery.
+    ///
+    /// A stale or unknown token changes nothing. `lease_ms = 0` uses the
+    /// engine default. History is unaffected; only the deadline moves.
+    pub fn touch(&self, token: &DeliveryToken, lease_ms: u64) -> Result<TouchOutcome> {
+        let lease_ms = if lease_ms == 0 {
+            self.options.lease_ms
+        } else {
+            lease_ms
+        };
+        let now = now_ms();
+        let deadline_ms = now.saturating_add(lease_ms);
+        let mut writer = self.writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT delivery_id FROM entries
+                 WHERE entry_id = ?1 AND state = 'inflight'",
+                [to_i64(token.message_id)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let outcome = match current {
+            None => TouchOutcome::Unknown,
+            Some(delivery_id) if from_i64(delivery_id)? != token.delivery_id => TouchOutcome::Stale,
+            Some(_) => {
+                tx.execute(
+                    "UPDATE entries
+                     SET lease_deadline_ms = ?1, updated_at_ms = ?2
+                     WHERE entry_id = ?3 AND state = 'inflight' AND delivery_id = ?4",
+                    params![
+                        to_i64(deadline_ms)?,
+                        to_i64(now)?,
+                        to_i64(token.message_id)?,
+                        to_i64(token.delivery_id)?
+                    ],
+                )?;
+                TouchOutcome::Extended
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// Settle one delivery and publish its result in the same transaction.
