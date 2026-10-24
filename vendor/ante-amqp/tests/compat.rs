@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ante_amqp::frame::{
-    method_payload, read_frame, write_frame, Encoder, TableValue, BASIC_PUBLISH, CHANNEL_OPEN,
-    CHANNEL_OPEN_OK, CLASS_BASIC, CLASS_CHANNEL, CLASS_CONNECTION, CONNECTION_CLOSE,
+    method_payload, read_frame, write_frame, Encoder, TableValue, BASIC_GET, BASIC_PUBLISH,
+    CHANNEL_OPEN, CHANNEL_OPEN_OK, CLASS_BASIC, CLASS_CHANNEL, CLASS_CONNECTION, CONNECTION_CLOSE,
     CONNECTION_OPEN, CONNECTION_OPEN_OK, CONNECTION_START, CONNECTION_START_OK, CONNECTION_TUNE,
     CONNECTION_TUNE_OK, FRAME_BODY, FRAME_HEADER, FRAME_HEARTBEAT, FRAME_METHOD,
 };
@@ -1628,6 +1628,46 @@ async fn heartbeat_timeout_closes_a_silent_peer() {
     .expect("server did not close a silent peer")
     .expect("connection closed without a connection.close frame");
     assert_eq!(close, 320);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_timeout_requeues_an_inflight_delivery() {
+    let harness = Harness::start_with_options(ante_amqp::ServerOptions {
+        heartbeat_ms: 1000,
+        ..Default::default()
+    })
+    .await;
+    harness.ante.declare_queue("jobs").unwrap();
+    harness
+        .ante
+        .publish(
+            "jobs",
+            ante_core::NewMessage {
+                payload: b"long job".to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut raw = RawClient::connect_with_heartbeat(harness.port, 1).await;
+    raw.open_channel(1).await;
+    let mut args = Encoder::new();
+    args.u16(0).shortstr("jobs").u8(0);
+    raw.method(1, CLASS_BASIC, BASIC_GET, &args.finish()).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while harness.info("jobs").inflight != 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "get did not take the job"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let info = harness.info("jobs");
+    assert_eq!(info.inflight, 0);
+    assert_eq!(info.ready, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
