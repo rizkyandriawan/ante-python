@@ -2,7 +2,7 @@ from .channel import BasicProperties, Channel
 from .client import AckResult, Ante, Delivery
 from .codec import BINARY_TYPE, JSON_TYPE, TEXT_TYPE, decode_payload, encode_payload
 from .consumer import Consumer
-from .errors import AnteError
+from .errors import AnteError, UnroutableError
 
 __all__ = [
     "BINARY_TYPE",
@@ -15,6 +15,7 @@ __all__ = [
     "Channel",
     "Consumer",
     "Delivery",
+    "UnroutableError",
     "decode_payload",
     "encode_payload",
 ]

@@ -212,3 +212,55 @@ fn version_one_database_is_migrated_with_timestamps() {
         .unwrap();
     assert_eq!(outcome, "acked");
 }
+
+#[test]
+fn legacy_indexes_are_rebuilt_on_open() {
+    let temp = TempDir::new();
+    let path = temp.path.join("ante.sqlite3");
+    {
+        let ante = Ante::open(&path).unwrap();
+        ante.declare_queue("jobs").unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                DROP INDEX attempts_finished;
+                CREATE INDEX attempts_finished
+                    ON delivery_attempts(finished_at_ms, delivery_id);
+                CREATE INDEX attempts_queue
+                    ON delivery_attempts(queue_id, started_at_ms);
+                UPDATE metadata SET value = 2 WHERE key = 'schema_version';
+                PRAGMA user_version = 2;
+                "#,
+            )
+            .unwrap();
+    }
+
+    let ante = Ante::open(&path).unwrap();
+    ante.declare_queue("jobs").unwrap();
+    drop(ante);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let index_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'attempts_finished'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_sql.contains("WHERE finished_at_ms IS NOT NULL"));
+    let queue_indexes: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'attempts_queue'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queue_indexes, 0);
+}

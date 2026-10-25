@@ -492,7 +492,7 @@ async fn two_consumers_on_one_channel_respect_prefetch() {
 
     let channel = connection.create_channel().await.unwrap();
     channel
-        .basic_qos(1, BasicQosOptions::default())
+        .basic_qos(1, BasicQosOptions { global: true })
         .await
         .unwrap();
     let mut first = channel

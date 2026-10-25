@@ -27,6 +27,7 @@ with Ante.open() as connection:
     channel = connection.channel()
     channel.queue_declare(queue="jobs", durable=True)
     channel.basic_qos(prefetch_count=32)
+    channel.confirm_delivery()
 
     def on_message(ch, method, properties, body):
         print(body)  # bytes, like pika
@@ -70,15 +71,21 @@ simultaneously.
   dispatcher drains workers. Closing a channel requeues remaining unacked
   deliveries. Active Python callbacks cannot be forcibly killed; consumer
   shutdown waits up to its timeout (10 seconds by default).
-- Uncaught callback exceptions are retried, then dropped after five attempts.
-  For custom retry policy/timeouts, use the high-level API below.
+- Callback exceptions stop the dispatcher and propagate from `start_consuming`.
+  Unacked deliveries remain pending until explicitly settled, channel close,
+  or lease expiry. The high-level `consume` API separately retains its retry/drop
+  policy; the Pika-style channel does not silently retry or discard on failure.
+- QoS follows RabbitMQ: `global_qos=False` captures a per-consumer limit when
+  registering; `global_qos=True` adds a shared channel limit. Zero (the default)
+  means no unacked limit. Auto-ACK consumers and `basic_get` ignore QoS. Internal
+  dispatch batches and queued callbacks remain bounded.
 
 Threads overlap network/disk I/O. Pure Python CPU work remains limited by the
 GIL on standard CPython. Rust storage operations release the GIL while running;
 SQLite transactions are serialized inside the engine. Parallel callbacks can
 complete out of order. Delivery is **at-least-once**: jobs must tolerate retries.
-A lease defaults to 30 seconds; configure `lease_ms` in the high-level consumer
-for longer jobs. Call `delivery.touch()` to extend the lease while a handler is
+Channel deliveries use the same 30-minute lease as the AMQP endpoint. The
+high-level API defaults to 30 seconds; configure `lease_ms` for longer jobs. Call `delivery.touch()` to extend the lease while a handler is
 still working; renewal does not create a new attempt.
 
 The concurrency design follows Pika's official threaded-consumer examples:
@@ -94,9 +101,11 @@ not bundled Pika code, and does not require Pika as a dependency.
 
 | Operation | API |
 | --- | --- |
-| Declare / inspect queue | `queue_declare(queue, passive=False, durable=True)` |
+| Declare / inspect queue | `queue_declare(queue, passive=False, durable=False)` |
 | Set per-consumer outstanding limit | `basic_qos(prefetch_count=32)` |
-| Publish | `basic_publish(exchange="", routing_key="jobs", body=b"...")` |
+| Enable publisher confirms | `confirm_delivery()` (embedded publishes always wait for commit) |
+| Publish | `basic_publish(exchange="", routing_key="jobs", body=b"...")` → `None` |
+| Unroutable callback | `add_on_return_callback(callback)` |
 | Register consumer | `basic_consume(queue, on_message_callback, auto_ack=False, concurrency=8)` |
 | Run dispatcher / stop | `start_consuming()` / `stop_consuming(consumer_tag=None)` |
 | Cancel one consumer | `basic_cancel(consumer_tag)` |
@@ -104,6 +113,7 @@ not bundled Pika code, and does not require Pika as a dependency.
 | Acknowledge | `basic_ack(delivery_tag, multiple=False)` |
 | Retry / discard | `basic_nack(delivery_tag, multiple=False, requeue=True)` |
 | Reject one | `basic_reject(delivery_tag, requeue=True)` |
+| Recover unacked deliveries | `basic_recover(requeue=True)` |
 | Purge / delete | `queue_purge(queue)` / `queue_delete(queue)` |
 | Close | `close()` |
 
@@ -117,12 +127,37 @@ Methods expose `delivery_tag`, `consumer_tag`, `routing_key`, `exchange`,
 `redelivered`, and Ante's `attempts` extension.
 
 This is a **Pika-style API over Ante**, not full RabbitMQ compatibility.
-Only the default exchange (`""`, routing key = queue name), named durable queues,
-and positive prefetch counts are supported. Exclusive/auto-delete queues,
-queue arguments, byte/global QoS, custom exchanges, and conditional queue deletion
-raise errors. `durable=False` does not disable Ante durability. `mandatory` does
-not alter publishing: a missing queue always raises `AnteError`.
-Register consumers and set QoS before starting the dispatcher.
+The supported profile is the default exchange (`""`, routing key = queue name)
+and named queues. All messages/queues remain durable even with `durable=False`.
+Exclusive/auto-delete queues, queue arguments, byte QoS, custom exchanges, and
+conditional queue deletion in the direct adapter raise errors. The AMQP listener
+supports conditional deletion. Register consumers before starting the dispatcher.
+
+Channel publishing accepts bytes or UTF-8 strings, preserves the supported
+properties (including missing versus empty values), and returns `None`, like
+Pika. For JSON/dicts or Ante message IDs, use `Ante.publish`, which retains its
+high-level encoding and integer return value.
+
+Publishing to a missing queue with `mandatory=False` drops the message, like
+RabbitMQ. With `mandatory=True`, confirm mode raises `ante.UnroutableError`
+(with `.messages`); without confirms it invokes registered return callbacks.
+High-level `Ante.publish` continues to raise `QUEUE_NOT_FOUND`.
+
+The embedded API uses `AnteError` rather than Pika's protocol exception
+hierarchy, and does not emulate every wire-level channel closure after invalid
+calls. Callback dispatch runs on Ante worker threads; cancellation drains workers
+and `basic_cancel` returns `None`, rather than Pika's buffered-message list.
+The supported method parameter names/defaults match Pika, with optional
+keyword-only Ante extensions. `BasicProperties` is a supported-field subset, not all AMQP properties.
+Use Pika against `serve_amqp()` when full client-side protocol behavior is needed.
+Manual AMQP `basic_ack` has no broker reply; use a subsequent RPC/recovery check
+when testing durability, rather than treating the method return as a storage ACK.
+
+The shared contract suite is `tests/test_pika_contract.py`. It always checks the
+direct adapter and the embedded AMQP listener. To include a standalone Ante
+and a RabbitMQ reference, set `ANTE_STANDALONE_AMQP=127.0.0.1:15679` and
+`ANTE_REFERENCE_AMQP=127.0.0.1:5672` when running unittest. These test endpoints
+must use disposable storage; the suite creates/deletes unique test queues.
 
 ## High-level API and Ante features
 
@@ -212,6 +247,24 @@ rejected, and secure mode has no plaintext fallback. The JSON schema, permission
 matrix, Argon2id hash generation, and client examples are documented in Ante's
 [security guide](https://github.com/rizkyandriawan/ante/blob/main/docs/security.md).
 Use port `0` for an OS-assigned port.
+
+### AMQP 1.0 listener
+
+`serve_amqp1()` starts the separate AMQP 1.0 endpoint on the same embedded
+engine. It supports the same secure profile, sender/receiver links, and
+settlement mapping described in Ante's
+[AMQP 1.0 guide](https://github.com/rizkyandriawan/ante/blob/main/docs/amqp1.md):
+
+```python
+with Ante.open() as ante:
+    host, port = ante.serve_amqp1(port=0)
+    # AMQP 1.0 clients can target queue addresses directly.
+    ante.stop_amqp1()
+```
+
+The AMQP 0-9-1 and AMQP 1.0 listeners can run at the same time; `close()`
+stops and joins both. The plaintext profile has no SASL layer, so clients that
+enable SASL by default must disable it when no `security_path` is supplied.
 
 ## Development / verification
 

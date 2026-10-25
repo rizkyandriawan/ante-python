@@ -163,6 +163,24 @@ class Ante:
     def stop_amqp(self) -> None:
         self._call("stop_amqp")
 
+    def serve_amqp1(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 5673,
+        *,
+        security_path: str | os.PathLike[str] | None = None,
+    ) -> tuple[str, int]:
+        """Listen for AMQP 1.0 clients on the same embedded queue engine."""
+        return self._call(
+            "serve_amqp1",
+            host,
+            port,
+            None if security_path is None else os.fspath(security_path),
+        )
+
+    def stop_amqp1(self) -> None:
+        self._call("stop_amqp1")
+
     def declare(self, queue: str) -> int:
         return self._call("declare", queue)
 
@@ -183,9 +201,9 @@ class Ante:
             body,
             (
                 content_type or default_type,
-                message_id or "",
-                correlation_id or "",
-                reply_to or "",
+                message_id,
+                correlation_id,
+                reply_to,
             ),
         )
         self._wake.set()

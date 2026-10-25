@@ -1,0 +1,18 @@
+[package]
+name = "ante-amqp1"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+ante-core = { path = "../ante-core" }
+ante-security = { path = "../ante-security" }
+fe2o3-amqp = { version = "0.18.4", path = "vendor/fe2o3-amqp", features = ["acceptor", "rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+socket2 = "0.6"
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio-rustls = "0.26"
+serde_json = "1"
+tempfile = "3"

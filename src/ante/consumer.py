@@ -32,10 +32,11 @@ class Consumer:
         max_attempts: int | None,
         shutdown_timeout: float,
         ack_on_return: bool,
+        take: Callable[[int], list[Delivery]] | None = None,
     ) -> None:
-        if prefetch < 1:
-            raise ValueError("prefetch must be at least 1")
-        workers = concurrency if concurrency is not None else prefetch
+        if prefetch < 0:
+            raise ValueError("prefetch must be nonnegative")
+        workers = concurrency if concurrency is not None else (prefetch or 16)
         if workers < 1:
             raise ValueError("concurrency must be at least 1")
         self._ante = ante
@@ -53,6 +54,7 @@ class Consumer:
             raise ValueError("timeouts must be nonnegative")
         self._ack_on_return = ack_on_return
         self._shutdown_timeout = shutdown_timeout
+        self._take = take
 
         self._stopped = threading.Event()
         self._condition = threading.Condition()
@@ -131,19 +133,28 @@ class Consumer:
                     for token, delivery in self._outstanding.items()
                     if not delivery.settled and delivery.deadline_ms > now_ms
                 }
-                capacity = self._prefetch - len(self._outstanding)
+                # Zero disables the unacked limit, not the bound on queued work.
+                capacity = (
+                    self._prefetch - len(self._outstanding)
+                    if self._prefetch
+                    else 256 - self._active
+                )
                 if capacity <= 0:
                     self._condition.wait(0.02)
             if self._stopped.is_set() or capacity <= 0:
                 continue
 
             try:
-                deliveries = self._ante._take_now(
-                    self._queue,
-                    max=min(capacity, 256),
-                    lease_ms=self._lease_ms,
-                    parse=self._parse,
-                    queue_id=self._queue_id,
+                deliveries = (
+                    self._take(min(capacity, 256))
+                    if self._take
+                    else self._ante._take_now(
+                        self._queue,
+                        max=min(capacity, 256),
+                        lease_ms=self._lease_ms,
+                        parse=self._parse,
+                        queue_id=self._queue_id,
+                    )
                 )
                 if not deliveries:
                     self._stopped.wait(
@@ -211,6 +222,10 @@ class Consumer:
             )
             if action == "requeue":
                 delivery.requeue()
+            elif action == "leave":
+                # Channel callbacks own their settlement; an exception must not
+                # silently apply the high-level consumer's retry/drop policy.
+                return
             else:
                 delivery.discard()
         except AnteError as settle_error:

@@ -65,10 +65,9 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
 );
 CREATE INDEX IF NOT EXISTS attempts_entry
     ON delivery_attempts(entry_id, attempt);
-CREATE INDEX IF NOT EXISTS attempts_queue
-    ON delivery_attempts(queue_id, started_at_ms);
 CREATE INDEX IF NOT EXISTS attempts_finished
-    ON delivery_attempts(finished_at_ms, delivery_id);
+    ON delivery_attempts(finished_at_ms, delivery_id)
+    WHERE finished_at_ms IS NOT NULL;
 CREATE INDEX IF NOT EXISTS entries_ready
     ON entries(queue_id, ready_seq) WHERE state = 'ready';
 CREATE INDEX IF NOT EXISTS entries_inflight
@@ -95,10 +94,9 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
 );
 CREATE INDEX IF NOT EXISTS attempts_entry
     ON delivery_attempts(entry_id, attempt);
-CREATE INDEX IF NOT EXISTS attempts_queue
-    ON delivery_attempts(queue_id, started_at_ms);
 CREATE INDEX IF NOT EXISTS attempts_finished
-    ON delivery_attempts(finished_at_ms, delivery_id);
+    ON delivery_attempts(finished_at_ms, delivery_id)
+    WHERE finished_at_ms IS NOT NULL;
 "#;
 
 pub const DEFAULT_LEASE_MS: u64 = 30_000;
@@ -524,7 +522,7 @@ impl Ante {
         requeue_expired_tx(&tx, now)?;
 
         let picked: Vec<PickedEntry> = {
-            let mut statement = tx.prepare(
+            let mut statement = tx.prepare_cached(
                 "SELECT entry_id, payload, content_type, application_message_id,
                         correlation_id, reply_to, attempts, ready_seq, created_at_ms
                  FROM entries
@@ -559,7 +557,7 @@ impl Ante {
         let mut next_delivery = next_meta(&tx, META_NEXT_DELIVERY)?;
         let mut deliveries = Vec::with_capacity(picked.len());
         {
-            let mut update = tx.prepare(
+            let mut update = tx.prepare_cached(
                 "UPDATE entries
                  SET state = 'inflight', delivery_id = ?1,
                      lease_deadline_ms = ?2, attempts = attempts + 1,
@@ -581,21 +579,21 @@ impl Ante {
                         "ready entry changed during claim".to_string(),
                     ));
                 }
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT INTO delivery_attempts
                      (delivery_id, entry_id, queue_id, queue_name,
                       message_created_at_ms, attempt, started_at_ms, finished_at_ms, outcome)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'inflight')",
-                    params![
-                        to_i64(delivery_id)?,
-                        entry.entry_id,
-                        queue_id,
-                        queue,
-                        entry.created_at_ms,
-                        entry.attempts + 1,
-                        to_i64(now)?,
-                    ],
-                )?;
+                )?
+                .execute(params![
+                    to_i64(delivery_id)?,
+                    entry.entry_id,
+                    queue_id,
+                    queue,
+                    entry.created_at_ms,
+                    entry.attempts + 1,
+                    to_i64(now)?,
+                ])?;
                 deliveries.push(Delivery {
                     token: DeliveryToken {
                         message_id: from_i64(entry.entry_id)?,
@@ -768,12 +766,11 @@ impl Ante {
         let mut outcomes = Vec::with_capacity(tokens.len());
         for token in tokens {
             let current: Option<i64> = tx
-                .query_row(
+                .prepare_cached(
                     "SELECT delivery_id FROM entries
                      WHERE entry_id = ?1 AND state = 'inflight'",
-                    [to_i64(token.message_id)?],
-                    |row| row.get(0),
-                )
+                )?
+                .query_row([to_i64(token.message_id)?], |row| row.get(0))
                 .optional()?;
             match current {
                 None => outcomes.push(AckOutcome::Unknown),
@@ -781,23 +778,26 @@ impl Ante {
                     outcomes.push(AckOutcome::Stale)
                 }
                 Some(_) => {
-                    tx.execute(
+                    tx.prepare_cached(
                         "UPDATE delivery_attempts
                          SET finished_at_ms = ?1, outcome = ?2
                          WHERE entry_id = ?3 AND delivery_id = ?4
                            AND finished_at_ms IS NULL",
-                        params![
-                            to_i64(now)?,
-                            outcome.as_str(),
-                            to_i64(token.message_id)?,
-                            to_i64(token.delivery_id)?
-                        ],
-                    )?;
-                    tx.execute(
+                    )?
+                    .execute(params![
+                        to_i64(now)?,
+                        outcome.as_str(),
+                        to_i64(token.message_id)?,
+                        to_i64(token.delivery_id)?
+                    ])?;
+                    tx.prepare_cached(
                         "DELETE FROM entries
                          WHERE entry_id = ?1 AND state = 'inflight' AND delivery_id = ?2",
-                        params![to_i64(token.message_id)?, to_i64(token.delivery_id)?],
-                    )?;
+                    )?
+                    .execute(params![
+                        to_i64(token.message_id)?,
+                        to_i64(token.delivery_id)?
+                    ])?;
                     outcomes.push(AckOutcome::Acked);
                 }
             }
@@ -1200,6 +1200,7 @@ fn configure(connection: &Connection, cache_kib: i64, writable: bool) -> Result<
         connection.execute_batch("PRAGMA synchronous = FULL;")?;
     }
     connection.execute_batch(&format!("PRAGMA cache_size = -{cache_kib};"))?;
+    connection.set_prepared_statement_cache_capacity(64);
     Ok(())
 }
 
@@ -1273,10 +1274,7 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<()> {
             "database metadata schema does not match user_version".into(),
         ));
     }
-    connection.execute_batch(
-        "CREATE INDEX IF NOT EXISTS attempts_finished
-         ON delivery_attempts(finished_at_ms, delivery_id);",
-    )?;
+    migrate_indexes(connection)?;
     Ok(())
 }
 
@@ -1312,6 +1310,43 @@ fn migrate_v1(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_indexes(connection: &mut Connection) -> Result<()> {
+    let (finished_sql, has_queue_index): (Option<String>, bool) = {
+        let finished_sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'attempts_finished'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let has_queue_index = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'attempts_queue')",
+            [],
+            |row| row.get(0),
+        )?;
+        (finished_sql, has_queue_index)
+    };
+    let finished_is_partial = finished_sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("WHERE finished_at_ms IS NOT NULL"));
+    if finished_is_partial && !has_queue_index {
+        return Ok(());
+    }
+
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !finished_is_partial {
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS attempts_finished;
+             CREATE INDEX attempts_finished
+                 ON delivery_attempts(finished_at_ms, delivery_id)
+                 WHERE finished_at_ms IS NOT NULL;",
+        )?;
+    }
+    tx.execute_batch("DROP INDEX IF EXISTS attempts_queue;")?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn queue_id_tx(tx: &Transaction<'_>, queue: &str) -> Result<u64> {
     let id: Option<i64> = tx
         .query_row("SELECT id FROM queues WHERE name = ?1", [queue], |row| {
@@ -1339,11 +1374,11 @@ fn next_meta(tx: &Transaction<'_>, key: &str) -> Result<u64> {
 }
 
 fn set_meta(tx: &Transaction<'_>, key: &str, value: u64) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO metadata (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, to_i64(value)?],
-    )?;
+    )?
+    .execute(params![key, to_i64(value)?])?;
     Ok(())
 }
 
@@ -1357,7 +1392,7 @@ fn insert_messages_tx(
     let mut next_seq = queue_next_seq(tx, queue_id)?;
     let mut ids = Vec::with_capacity(messages.len());
     {
-        let mut insert = tx.prepare(
+        let mut insert = tx.prepare_cached(
             "INSERT INTO entries
              (entry_id, queue_id, ready_seq, payload, content_type,
               application_message_id, correlation_id, reply_to,
@@ -1389,19 +1424,15 @@ fn insert_messages_tx(
 }
 
 fn queue_next_seq(tx: &Transaction<'_>, queue_id: i64) -> Result<u64> {
-    let value: i64 = tx.query_row(
-        "SELECT next_ready_seq FROM queues WHERE id = ?1",
-        [queue_id],
-        |row| row.get(0),
-    )?;
+    let value: i64 = tx
+        .prepare_cached("SELECT next_ready_seq FROM queues WHERE id = ?1")?
+        .query_row([queue_id], |row| row.get(0))?;
     from_i64(value)
 }
 
 fn set_queue_next_seq(tx: &Transaction<'_>, queue_id: i64, value: u64) -> Result<()> {
-    tx.execute(
-        "UPDATE queues SET next_ready_seq = ?1 WHERE id = ?2",
-        params![to_i64(value)?, queue_id],
-    )?;
+    tx.prepare_cached("UPDATE queues SET next_ready_seq = ?1 WHERE id = ?2")?
+        .execute(params![to_i64(value)?, queue_id])?;
     Ok(())
 }
 
@@ -1413,19 +1444,19 @@ fn requeue_entry(
     now: u64,
 ) -> Result<()> {
     let next = queue_next_seq(tx, queue_id)?;
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE delivery_attempts
          SET finished_at_ms = ?1, outcome = ?2
          WHERE entry_id = ?3 AND finished_at_ms IS NULL",
-        params![to_i64(now)?, outcome.as_str(), to_i64(entry_id)?],
-    )?;
-    tx.execute(
+    )?
+    .execute(params![to_i64(now)?, outcome.as_str(), to_i64(entry_id)?])?;
+    tx.prepare_cached(
         "UPDATE entries
          SET state = 'ready', ready_seq = ?1, delivery_id = NULL,
              lease_deadline_ms = NULL, updated_at_ms = ?3
          WHERE entry_id = ?2 AND state = 'inflight'",
-        params![to_i64(next)?, to_i64(entry_id)?, to_i64(now)?],
-    )?;
+    )?
+    .execute(params![to_i64(next)?, to_i64(entry_id)?, to_i64(now)?])?;
     set_queue_next_seq(
         tx,
         queue_id,
@@ -1436,7 +1467,7 @@ fn requeue_entry(
 
 fn requeue_expired_tx(tx: &Transaction<'_>, now: u64) -> Result<u64> {
     let targets: Vec<(i64, i64)> = {
-        let mut statement = tx.prepare(
+        let mut statement = tx.prepare_cached(
             "SELECT entry_id, queue_id FROM entries
              WHERE state = 'inflight' AND lease_deadline_ms <= ?1
              ORDER BY entry_id",
@@ -1465,7 +1496,7 @@ fn requeue_expired_tx(tx: &Transaction<'_>, now: u64) -> Result<u64> {
 fn requeue_all_inflight(tx: &Transaction<'_>) -> Result<u64> {
     let now = now_ms();
     let targets: Vec<(i64, i64)> = {
-        let mut statement = tx.prepare(
+        let mut statement = tx.prepare_cached(
             "SELECT entry_id, queue_id FROM entries
              WHERE state = 'inflight'
              ORDER BY entry_id",

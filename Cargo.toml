@@ -5,7 +5,8 @@ edition = "2021"
 license = "MIT"
 
 [workspace]
-members = ["vendor/ante-core", "vendor/ante-amqp", "vendor/ante-security"]
+members = ["vendor/ante-core", "vendor/ante-amqp", "vendor/ante-amqp1", "vendor/ante-security"]
+exclude = ["vendor/ante-amqp1/vendor"]
 
 [lib]
 name = "_native"
@@ -16,5 +17,6 @@ crate-type = ["cdylib"]
 ante-core = { path = "vendor/ante-core" }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
 ante-amqp = { path = "vendor/ante-amqp" }
+ante-amqp1 = { path = "vendor/ante-amqp1" }
 ante-security = { path = "vendor/ante-security" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }

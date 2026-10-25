@@ -30,7 +30,6 @@ use crate::frame::{
 
 const SERVER_FRAME_MAX: u32 = 131_072;
 const SERVER_CHANNEL_MAX: u16 = 16;
-const DEFAULT_PREFETCH: u16 = 32;
 const MAX_TAKE: usize = 1024;
 const CONSUMER_POLL: Duration = Duration::from_millis(1);
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
@@ -711,11 +710,14 @@ struct Outstanding {
     /// True only after the delivery frame has been written to the client.
     /// Acknowledgements must never touch unsent deliveries.
     sent: bool,
+    /// Subscription identity, not its reusable string tag. None for basic.get.
+    consumer_id: Option<u64>,
 }
 
 struct ChannelState {
     generation: u64,
     prefetch: u16,
+    global_prefetch: u16,
     next_tag: u64,
     next_consumer: u64,
     outstanding: BTreeMap<u64, Outstanding>,
@@ -734,6 +736,7 @@ impl ChannelState {
         ChannelState {
             generation,
             prefetch: 0,
+            global_prefetch: 0,
             next_tag: 1,
             next_consumer: 1,
             outstanding: BTreeMap::new(),
@@ -750,13 +753,28 @@ impl ChannelState {
         self.outstanding.retain(|_, entry| entry.deadline_ms > now);
     }
 
-    fn available(&self) -> usize {
-        let prefetch = if self.prefetch == 0 {
-            DEFAULT_PREFETCH
-        } else {
-            self.prefetch
+    fn available(&self, consumer_id: u64, prefetch: u16, no_ack: bool) -> usize {
+        if no_ack {
+            return MAX_TAKE;
+        }
+        let remaining = |limit: u16, used: usize| {
+            if limit == 0 {
+                MAX_TAKE
+            } else {
+                (limit as usize).saturating_sub(used)
+            }
         };
-        (prefetch as usize).saturating_sub(self.outstanding.len() + self.reserved)
+        let own = self
+            .outstanding
+            .values()
+            .filter(|entry| entry.consumer_id == Some(consumer_id))
+            .count();
+        let total = self
+            .outstanding
+            .values()
+            .filter(|entry| entry.consumer_id.is_some())
+            .count();
+        remaining(prefetch, own).min(remaining(self.global_prefetch, total + self.reserved))
     }
 }
 
@@ -1605,11 +1623,27 @@ async fn handle_method(shared: &Arc<Shared>, frame: Frame) -> io::Result<bool> {
         }
         (CLASS_BASIC, BASIC_QOS) => {
             let mut parser = Parser::new(&args);
-            parser.u32()?;
+            let size = parser.u32()?;
             let prefetch = parser.u16()?;
-            parser.u8()?;
+            let global = parser.u8()? & 1 != 0;
+            if size != 0 {
+                channel_error(
+                    shared,
+                    channel,
+                    REPLY_NOT_IMPLEMENTED,
+                    "byte QoS is unsupported",
+                    CLASS_BASIC,
+                    BASIC_QOS,
+                )
+                .await?;
+                return Ok(false);
+            }
             if let Some(state) = shared.channels.lock().await.get_mut(&channel) {
-                state.prefetch = prefetch;
+                if global {
+                    state.global_prefetch = prefetch;
+                } else {
+                    state.prefetch = prefetch;
+                }
             }
             shared
                 .writer
@@ -1737,9 +1771,22 @@ async fn handle_queue_declare(shared: &Arc<Shared>, channel: u16, args: &[u8]) -
     let _reserved = parser.short()?;
     let queue = parser.shortstr()?;
     let bits = parser.u8()?;
-    parser.skip_table()?;
+    let arguments = parser.longstr_bytes()?;
     let passive = bits & 1 != 0;
     let no_wait = bits & 0x10 != 0;
+
+    if bits & 0x0c != 0 || !arguments.is_empty() {
+        channel_error(
+            shared,
+            channel,
+            REPLY_NOT_IMPLEMENTED,
+            "exclusive/auto-delete queues and queue arguments are unsupported",
+            CLASS_QUEUE,
+            QUEUE_DECLARE,
+        )
+        .await?;
+        return Ok(());
+    }
 
     if queue.is_empty() {
         channel_error(
@@ -1826,7 +1873,19 @@ async fn handle_consume(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::
     let queue = parser.shortstr()?;
     let requested_tag = parser.shortstr()?;
     let bits = parser.u8()?;
-    parser.skip_table()?;
+    let arguments = parser.longstr_bytes()?;
+    if bits & 0x04 != 0 || !arguments.is_empty() {
+        channel_error(
+            shared,
+            channel,
+            REPLY_NOT_IMPLEMENTED,
+            "exclusive consumers and consumer arguments are unsupported",
+            CLASS_BASIC,
+            BASIC_CONSUME,
+        )
+        .await?;
+        return Ok(());
+    }
     let no_ack = bits & 0x02 != 0;
     let no_wait = bits & 0x08 != 0;
     if !require_access(
@@ -1944,10 +2003,10 @@ async fn handle_consume(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(registration_id);
-            Some((tag, state.generation))
+            Some((tag, state.generation, state.prefetch))
         }
     };
-    let Some((consumer_tag, generation)) = registration_info else {
+    let Some((consumer_tag, generation, prefetch)) = registration_info else {
         drop(delivery_guard);
         drop(lifecycle_guard);
         channel_error(
@@ -2012,11 +2071,14 @@ async fn handle_consume(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::
     let registry = shared.registry.clone();
     let registrations = shared.registrations.clone();
     let consumer_drain = shared.drain.clone();
+    let consumer_shared = shared.clone();
     let handle = tokio::spawn(async move {
         let context = ConsumerContext {
+            shared: consumer_shared,
             ante: registration_ante.clone(),
             registration,
             generation,
+            prefetch,
             no_ack,
             shutdown: shutdown.clone(),
             lease_ms,
@@ -2045,9 +2107,11 @@ async fn handle_consume(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::
 }
 
 struct ConsumerContext {
+    shared: Arc<Shared>,
     ante: Arc<Ante>,
     registration: Registration,
     generation: u64,
+    prefetch: u16,
     no_ack: bool,
     shutdown: Arc<AtomicBool>,
     lease_ms: u64,
@@ -2057,14 +2121,21 @@ struct ConsumerContext {
 /// Reserve prefetch capacity on the channel instance this consumer was
 /// registered on. A closed and reopened channel number must not inherit work
 /// from the old task.
-async fn reserve(channels: &ChannelMap, channel: u16, generation: u64) -> Option<usize> {
+async fn reserve(
+    channels: &ChannelMap,
+    channel: u16,
+    generation: u64,
+    consumer_id: u64,
+    prefetch: u16,
+    no_ack: bool,
+) -> Option<usize> {
     let mut guard = channels.lock().await;
     let state = guard.get_mut(&channel)?;
     if state.generation != generation {
         return None;
     }
     state.prune_expired(now_ms());
-    let available = state.available().min(MAX_TAKE);
+    let available = state.available(consumer_id, prefetch, no_ack).min(MAX_TAKE);
     if available > 0 {
         state.reserved += available;
     }
@@ -2149,9 +2220,11 @@ async fn remove_stale_outstanding(
 
 async fn consumer_loop(context: ConsumerContext) -> io::Result<bool> {
     let ConsumerContext {
+        shared,
         ante,
         registration,
         generation,
+        prefetch,
         no_ack,
         shutdown,
         lease_ms,
@@ -2175,7 +2248,16 @@ async fn consumer_loop(context: ConsumerContext) -> io::Result<bool> {
             return Ok(false);
         }
 
-        let Some(to_take) = reserve(&channels, channel, generation).await else {
+        let Some(to_take) = reserve(
+            &channels,
+            channel,
+            generation,
+            subscription.id(),
+            prefetch,
+            no_ack,
+        )
+        .await
+        else {
             return Ok(false);
         };
 
@@ -2249,7 +2331,7 @@ async fn consumer_loop(context: ConsumerContext) -> io::Result<bool> {
             requeue_tokens(&ante, &drain, deliveries.into_iter().map(|d| d.token)).await;
             return Ok(false);
         };
-        let _delivery_guard = delivery_lock.lock().await;
+        let delivery_guard = delivery_lock.lock().await;
 
         if subscription.cancel.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
             release_reservation(&channels, channel, generation, to_take).await;
@@ -2274,6 +2356,11 @@ async fn consumer_loop(context: ConsumerContext) -> io::Result<bool> {
                                 queue: queue.clone(),
                                 queue_id: delivery.queue_id,
                                 sent: false,
+                                consumer_id: if no_ack {
+                                    None
+                                } else {
+                                    Some(subscription.id())
+                                },
                             },
                         );
                         entries.push((tag, delivery));
@@ -2344,7 +2431,19 @@ async fn consumer_loop(context: ConsumerContext) -> io::Result<bool> {
             if no_ack {
                 let engine = ante.clone();
                 let token = delivery.token.clone();
-                let _ = blocking(&drain, move || engine.ack(&token)).await;
+                if let Err(err) = blocking(&drain, move || engine.ack(&token)).await {
+                    drop(delivery_guard);
+                    channel_error(
+                        &shared,
+                        channel,
+                        map_error(&err),
+                        &err.to_string(),
+                        CLASS_BASIC,
+                        BASIC_CONSUME,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 let mut guard = channels.lock().await;
                 if let Some(state) = guard.get_mut(&channel) {
                     state.outstanding.remove(&tag);
@@ -2646,9 +2745,21 @@ async fn finish_publish(
     }
     let ante = shared.ante.clone();
     let queue_for_check = queue.clone();
-    let exists = blocking(&shared.drain, move || ante.queue_exists(&queue_for_check))
-        .await
-        .unwrap_or(false);
+    let exists = match blocking(&shared.drain, move || ante.queue_exists(&queue_for_check)).await {
+        Ok(exists) => exists,
+        Err(err) => {
+            channel_error(
+                shared,
+                channel,
+                map_error(&err),
+                &err.to_string(),
+                CLASS_BASIC,
+                BASIC_PUBLISH,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     if !exists {
         if pending.mandatory {
@@ -2813,6 +2924,7 @@ async fn handle_get(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::Resu
                 queue: queue.clone(),
                 queue_id: delivery.queue_id,
                 sent: false,
+                consumer_id: None,
             },
         );
         tag
@@ -2858,7 +2970,17 @@ async fn handle_get(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::Resu
     if no_ack {
         let ante = shared.ante.clone();
         let token = delivery.token.clone();
-        let _ = blocking(&shared.drain, move || ante.ack(&token)).await;
+        if let Err(err) = blocking(&shared.drain, move || ante.ack(&token)).await {
+            return channel_error(
+                shared,
+                channel,
+                map_error(&err),
+                &err.to_string(),
+                CLASS_BASIC,
+                BASIC_GET,
+            )
+            .await;
+        }
         let mut channels = shared.channels.lock().await;
         if let Some(state) = channels.get_mut(&channel) {
             state.outstanding.remove(&tag);
@@ -2925,19 +3047,32 @@ async fn handle_ack(shared: &Arc<Shared>, channel: u16, args: &[u8]) -> io::Resu
         return Ok(());
     }
     let tokens = {
-        let mut channels = shared.channels.lock().await;
-        let Some(state) = channels.get_mut(&channel) else {
+        let channels = shared.channels.lock().await;
+        let Some(state) = channels.get(&channel) else {
             return Ok(());
         };
-        remove_keys(state, &keys)
-            .into_iter()
-            .map(|(token, _)| token)
+        keys.iter()
+            .filter_map(|key| state.outstanding.get(key))
+            .map(|entry| entry.token.clone())
             .collect::<Vec<_>>()
     };
-    drop(delivery_guard);
     let ante = shared.ante.clone();
     if let Err(err) = blocking(&shared.drain, move || ante.ack_batch(&tokens)).await {
-        eprintln!("ante-amqp: ack failed: {err}");
+        drop(delivery_guard);
+        // Keep ownership until the commit succeeds. Channel teardown can then
+        // requeue the claims if settlement failed instead of losing their tags.
+        return channel_error(
+            shared,
+            channel,
+            map_error(&err),
+            &err.to_string(),
+            CLASS_BASIC,
+            BASIC_ACK,
+        )
+        .await;
+    }
+    if let Some(state) = shared.channels.lock().await.get_mut(&channel) {
+        remove_keys(state, &keys);
     }
     Ok(())
 }
@@ -3071,17 +3206,19 @@ async fn handle_reject(
         return Ok(());
     }
     let entries = {
-        let mut channels = shared.channels.lock().await;
-        let Some(state) = channels.get_mut(&channel) else {
+        let channels = shared.channels.lock().await;
+        let Some(state) = channels.get(&channel) else {
             return Ok(());
         };
-        remove_keys(state, &keys)
+        keys.iter()
+            .filter_map(|key| state.outstanding.get(key))
+            .map(|entry| entry.token.clone())
+            .collect::<Vec<_>>()
     };
-    drop(delivery_guard);
 
     let ante = shared.ante.clone();
-    let _ = blocking(&shared.drain, move || {
-        for (token, _) in entries {
+    let result = blocking(&shared.drain, move || {
+        for token in entries {
             if requeue {
                 ante.requeue(&token)?;
             } else {
@@ -3091,6 +3228,21 @@ async fn handle_reject(
         Ok(())
     })
     .await;
+    if let Err(err) = result {
+        drop(delivery_guard);
+        return channel_error(
+            shared,
+            channel,
+            map_error(&err),
+            &err.to_string(),
+            CLASS_BASIC,
+            if nack { BASIC_NACK } else { BASIC_REJECT },
+        )
+        .await;
+    }
+    if let Some(state) = shared.channels.lock().await.get_mut(&channel) {
+        remove_keys(state, &keys);
+    }
     Ok(())
 }
 
@@ -3114,15 +3266,14 @@ async fn recover_channel(shared: &Arc<Shared>, channel: u16) -> io::Result<bool>
                 {
                     None
                 } else {
-                    state.outstanding.clear();
                     Some(entries)
                 }
             }
             None => Some(Vec::new()),
         }
     };
-    drop(delivery_guard);
     let Some(entries) = entries else {
+        drop(delivery_guard);
         channel_error(
             shared,
             channel,
@@ -3138,13 +3289,29 @@ async fn recover_channel(shared: &Arc<Shared>, channel: u16) -> io::Result<bool>
         return Ok(true);
     }
     let ante = shared.ante.clone();
-    let _ = blocking(&shared.drain, move || {
+    let result = blocking(&shared.drain, move || {
         for (token, _) in entries {
             ante.requeue(&token)?;
         }
         Ok(())
     })
     .await;
+    if let Err(err) = result {
+        drop(delivery_guard);
+        channel_error(
+            shared,
+            channel,
+            map_error(&err),
+            &err.to_string(),
+            CLASS_BASIC,
+            BASIC_RECOVER,
+        )
+        .await?;
+        return Ok(false);
+    }
+    if let Some(state) = shared.channels.lock().await.get_mut(&channel) {
+        state.outstanding.clear();
+    }
     Ok(true)
 }
 
@@ -3391,6 +3558,7 @@ mod tests {
             queue: String::new(),
             queue_id: 0,
             sent,
+            consumer_id: Some(1),
         }
     }
 
@@ -3541,12 +3709,12 @@ mod tests {
         channels.lock().await.insert(0, reopened);
 
         assert_eq!(
-            reserve(&channels, 0, 1).await,
+            reserve(&channels, 0, 1, 1, 1, false).await,
             None,
             "a stale task reserved on the reopened instance"
         );
         assert_eq!(channels.lock().await.get(&0).unwrap().reserved, 0);
-        assert_eq!(reserve(&channels, 0, 2).await, Some(1));
+        assert_eq!(reserve(&channels, 0, 2, 1, 1, false).await, Some(1));
         assert_eq!(channels.lock().await.get(&0).unwrap().reserved, 1);
     }
 

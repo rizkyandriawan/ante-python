@@ -42,6 +42,22 @@ class AmqpTests(unittest.TestCase):
                 self.assertEqual(reopened.info("jobs")["total"], 0)
                 reopened.serve_amqp(port=port)
 
+    def test_amqp1_listener_start_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "db"
+            with Ante.open(path) as ante:
+                ante.declare("jobs")
+                host, port = ante.serve_amqp1(port=0)
+                self.assertEqual(host, "127.0.0.1")
+                self.assertGreater(port, 0)
+                with self.assertRaises(AnteError) as raised:
+                    ante.serve_amqp1(port=0)
+                self.assertEqual(raised.exception.code, "AMQP1")
+                ante.stop_amqp1()
+                host, port = ante.serve_amqp1(port=port)
+                self.assertEqual(host, "127.0.0.1")
+                ante.stop_amqp1()
+
 
 if __name__ == "__main__":
     unittest.main()
